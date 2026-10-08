@@ -6,7 +6,8 @@ idempotent migrations, and access to table repositories.
 
 import os
 import sqlite3
-from typing import List, Optional, Dict, Any
+from contextlib import contextmanager
+from typing import Iterator, List, Optional, Dict, Any
 from backend.models.app import App
 from backend.models.resource import Resource
 from database.repositories import (
@@ -17,6 +18,22 @@ from database.repositories import (
     EvictionLogRepository,
     ConflictLogRepository,
 )
+
+
+class _TransactionConnection:
+    """Connection wrapper that prevents nested repository contexts from committing."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def __enter__(self) -> sqlite3.Connection:
+        return self._connection
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
 
 
 class DatabaseManager:
@@ -38,6 +55,8 @@ class DatabaseManager:
     def __init__(self, db_path: str = "database/raae.db") -> None:
         self.db_path: str = db_path
         self._shared_conn: Optional[sqlite3.Connection] = None
+        self._transaction_conn: Optional[sqlite3.Connection] = None
+        self._transaction_depth: int = 0
 
         if db_path == ":memory:":
             self._shared_conn = sqlite3.connect(":memory:")
@@ -61,6 +80,9 @@ class DatabaseManager:
 
     def get_connection(self) -> sqlite3.Connection:
         """Returns a connection to the SQLite database with Row factory and foreign keys enabled."""
+        if self._transaction_conn is not None:
+            return _TransactionConnection(self._transaction_conn)
+
         if self._shared_conn is not None:
             return self._shared_conn
 
@@ -68,6 +90,34 @@ class DatabaseManager:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
         return conn
+
+    @contextmanager
+    def transaction(self) -> Iterator["DatabaseManager"]:
+        """Runs repository operations in one atomic database transaction."""
+        if self._transaction_conn is not None:
+            self._transaction_depth += 1
+            try:
+                yield self
+            finally:
+                self._transaction_depth -= 1
+            return
+
+        conn = self.get_connection()
+        self._transaction_conn = conn
+        self._transaction_depth = 1
+
+        try:
+            conn.execute("BEGIN;")
+            yield self
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._transaction_depth = 0
+            self._transaction_conn = None
+            if self._shared_conn is None:
+                conn.close()
 
     def init_db(self) -> None:
         """Initializes tables and idempotent seed data from schema.sql."""

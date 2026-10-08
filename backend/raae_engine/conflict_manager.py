@@ -33,8 +33,15 @@ class ResourceConflictManager:
 
         for resource_id in sorted(candidate.held_resources):
             resource = self.resource_manager.get_resource(resource_id)
-            if resource is not None:
-                held_resources.append(resource)
+            if resource is None:
+                resource = Resource(
+                    resource_id=resource_id,
+                    name=f"Unknown Resource {resource_id}",
+                    capacity=1,
+                    available_units=0,
+                    holders={candidate.app_id: 1}
+                )
+            held_resources.append(resource)
 
         return held_resources
 
