@@ -188,14 +188,22 @@ class DatabaseManager:
         return res
 
 
-    def log_memory_action(self, app_id: str, action: str, before: int, after: int, pressure: str) -> None:
+    def log_memory_action(
+        self,
+        app_id: str,
+        action: str,
+        before: int,
+        after: int,
+        pressure: str,
+        timestamp: Optional[float] = None
+    ) -> None:
         """Logs a memory allocation or deallocation event."""
         import time
         sql = """
             INSERT INTO memory_logs (app_id, action, memory_before, memory_after, pressure_level, timestamp)
             VALUES (?, ?, ?, ?, ?, ?)
         """
-        params = (app_id, action, before, after, pressure, time.time())
+        params = (app_id, action, before, after, pressure, timestamp if timestamp is not None else time.time())
         if self._shared_conn is not None:
             self._shared_conn.execute(sql, params)
             self._shared_conn.commit()
@@ -284,4 +292,3 @@ class DatabaseManager:
         if self._shared_conn is not None:
             self._shared_conn.close()
             self._shared_conn = None
-

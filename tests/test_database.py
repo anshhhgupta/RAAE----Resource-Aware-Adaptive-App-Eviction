@@ -77,6 +77,14 @@ class TestDatabaseManager(unittest.TestCase):
         self.assertEqual(retrieved.capacity, 1)
         self.assertEqual(retrieved.waiting_queue, ["app_2", "app_3"])
 
+    def test_log_memory_action_uses_provided_timestamp(self):
+        """Test that a supplied memory action timestamp is persisted."""
+        self.db.log_memory_action("app_1", "ALLOCATE", 100, 150, "GREEN", timestamp=123.5)
+
+        logs = self.db.get_all_memory_logs()
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0]["timestamp"], 123.5)
+
 
 if __name__ == "__main__":
     unittest.main()
