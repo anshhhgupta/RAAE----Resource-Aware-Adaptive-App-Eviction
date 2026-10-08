@@ -25,7 +25,7 @@ class RAAEEngine:
         return self.evaluate_eviction_candidate(candidate)
 
     def evaluate_eviction_candidate(self, candidate: App) -> RAAEEngineResult:
-        """Evaluates whether a clock-selected candidate is safe to evict."""
+        """Intercepts and evaluates a clock-selected eviction candidate."""
         held_resources = self.check_held_resources(candidate)
 
         if not held_resources:
@@ -71,18 +71,14 @@ class RAAEEngine:
         conflict_decision: ConflictDecision
     ) -> RAAEEngineResult:
         """Maps conflict status to the final eviction decision model."""
-        decision_type_by_status = {
-            ConflictStatus.NO_CONFLICT: EvictionDecisionType.SAFE_TO_EVICT,
-            ConflictStatus.WAIT: EvictionDecisionType.WAIT,
-            ConflictStatus.RESOLVE_REQUIRED: EvictionDecisionType.RESOLVE_REQUIRED,
-            ConflictStatus.BLOCKED: EvictionDecisionType.BLOCKED,
-            ConflictStatus.NOT_SAFE: EvictionDecisionType.NOT_SAFE,
-        }
-
-        decision_type = decision_type_by_status.get(
-            conflict_decision.status,
-            EvictionDecisionType.NOT_SAFE
-        )
+        if not held_resources and conflict_decision.status == ConflictStatus.NO_CONFLICT:
+            decision_type = EvictionDecisionType.ALLOW_EVICTION
+        elif held_resources and conflict_decision.status == ConflictStatus.NO_CONFLICT:
+            decision_type = EvictionDecisionType.RELEASE_THEN_EVICT
+        elif conflict_decision.status == ConflictStatus.WAIT:
+            decision_type = EvictionDecisionType.WAIT
+        else:
+            decision_type = EvictionDecisionType.CONFLICT
 
         eviction_decision = EvictionDecision(
             decision_type=decision_type,

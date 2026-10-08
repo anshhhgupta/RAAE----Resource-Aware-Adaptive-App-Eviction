@@ -27,12 +27,16 @@ class FixedConflictManager:
         self.decision = decision
         self.held_resources = held_resources or []
         self.calls = 0
+        self.last_candidate = None
+        self.last_held_resources = None
 
     def get_held_resources(self, candidate):
         return list(self.held_resources)
 
     def evaluate_eviction_conflict(self, candidate, held_resources):
         self.calls += 1
+        self.last_candidate = candidate
+        self.last_held_resources = tuple(held_resources)
         return self.decision
 
 
@@ -49,19 +53,36 @@ class TestRAAEEngine(unittest.TestCase):
 
         result = engine.evaluate_eviction_candidate(app)
 
-        self.assertEqual(result.decision_type, EvictionDecisionType.SAFE_TO_EVICT)
+        self.assertEqual(result.decision_type, EvictionDecisionType.ALLOW_EVICTION)
         self.assertTrue(result.can_evict)
         self.assertEqual(result.held_resources, ())
 
-    def test_candidate_holding_resource_without_waiters_is_safe_to_evict(self):
+    def test_candidate_holding_resource_without_waiters_requires_release_then_evict(self):
         app = App(app_id="app_1", name="Maps", reference_bit=0)
         self.resource_manager.acquire_resource(app, "GPS")
 
         result = self.engine.evaluate_eviction_candidate(app)
 
-        self.assertEqual(result.decision_type, EvictionDecisionType.SAFE_TO_EVICT)
-        self.assertTrue(result.can_evict)
+        self.assertEqual(result.decision_type, EvictionDecisionType.RELEASE_THEN_EVICT)
+        self.assertFalse(result.can_evict)
+        self.assertTrue(result.eviction_decision.requires_resource_release)
         self.assertEqual([resource.resource_id for resource in result.held_resources], ["GPS"])
+
+    def test_held_resource_candidate_is_sent_to_conflict_manager(self):
+        app = App(app_id="app_1", name="Maps", reference_bit=0)
+        gps = Resource("GPS", "GPS Location Sensor")
+        manager = FixedConflictManager(
+            ConflictDecision.no_conflict("No waiting app is blocked."),
+            held_resources=[gps]
+        )
+        engine = RAAEEngine(manager)
+
+        result = engine.evaluate_eviction_candidate(app)
+
+        self.assertEqual(result.decision_type, EvictionDecisionType.RELEASE_THEN_EVICT)
+        self.assertEqual(manager.calls, 1)
+        self.assertIs(manager.last_candidate, app)
+        self.assertEqual(manager.last_held_resources, (gps,))
 
     def test_candidate_holding_resource_with_waiters_requires_resolution(self):
         holder = App(app_id="holder", name="Maps", reference_bit=0)
@@ -73,7 +94,7 @@ class TestRAAEEngine(unittest.TestCase):
         result = self.engine.evaluate_eviction_candidate(holder)
 
         self.assertFalse(acquired)
-        self.assertEqual(result.decision_type, EvictionDecisionType.RESOLVE_REQUIRED)
+        self.assertEqual(result.decision_type, EvictionDecisionType.CONFLICT)
         self.assertFalse(result.can_evict)
         self.assertEqual(result.conflict_decision.resource_ids, ("GPS",))
         self.assertEqual(result.conflict_decision.waiting_app_ids, ("waiter",))
@@ -106,7 +127,7 @@ class TestRAAEEngine(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(result.candidate.app_id, "holder")
-        self.assertEqual(result.decision_type, EvictionDecisionType.RESOLVE_REQUIRED)
+        self.assertEqual(result.decision_type, EvictionDecisionType.CONFLICT)
         self.assertEqual(logs[-1]["action"], "selected_for_eviction")
 
 

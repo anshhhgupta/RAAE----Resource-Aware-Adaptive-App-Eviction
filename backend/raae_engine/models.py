@@ -11,11 +11,10 @@ from backend.models.resource import Resource
 class EvictionDecisionType(str, Enum):
     """Final eviction decisions returned by the RAAE Engine."""
 
-    SAFE_TO_EVICT = "SAFE_TO_EVICT"
+    ALLOW_EVICTION = "ALLOW_EVICTION"
     WAIT = "WAIT"
-    RESOLVE_REQUIRED = "RESOLVE_REQUIRED"
-    BLOCKED = "BLOCKED"
-    NOT_SAFE = "NOT_SAFE"
+    CONFLICT = "CONFLICT"
+    RELEASE_THEN_EVICT = "RELEASE_THEN_EVICT"
 
 
 class ConflictStatus(str, Enum):
@@ -92,7 +91,11 @@ class EvictionDecision:
 
     @property
     def can_evict(self) -> bool:
-        return self.decision_type == EvictionDecisionType.SAFE_TO_EVICT
+        return self.decision_type == EvictionDecisionType.ALLOW_EVICTION
+
+    @property
+    def requires_resource_release(self) -> bool:
+        return self.decision_type == EvictionDecisionType.RELEASE_THEN_EVICT
 
 
 @dataclass(frozen=True)
