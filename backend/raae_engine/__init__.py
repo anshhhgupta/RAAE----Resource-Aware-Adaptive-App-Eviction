@@ -6,16 +6,21 @@ from .models import (
     ConflictStatus,
     EvictionDecision,
     EvictionDecisionType,
+    EvictionEvent,
     RAAEEngineResult,
 )
+from .persistence import DatabaseEvictionPersistence, EvictionPersistence
 from .raae_engine import RAAEEngine
 
 __all__ = [
     "ConflictDecision",
     "ConflictManager",
     "ConflictStatus",
+    "DatabaseEvictionPersistence",
     "EvictionDecision",
     "EvictionDecisionType",
+    "EvictionEvent",
+    "EvictionPersistence",
     "RAAEEngine",
     "RAAEEngineResult",
     "ResourceConflictManager",

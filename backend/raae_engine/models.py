@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 from backend.models.app import App
 from backend.models.resource import Resource
@@ -99,6 +99,22 @@ class EvictionDecision:
 
 
 @dataclass(frozen=True)
+class EvictionEvent:
+    """Eviction workflow event that can be persisted by the persistence layer."""
+
+    app_id: str
+    algorithm: str
+    reason: str
+    decision_type: EvictionDecisionType
+    memory_before: int
+    memory_after: int
+    released_resource_ids: Tuple[str, ...] = field(default_factory=tuple)
+    lock_checked: bool = True
+    safe_release: bool = False
+    result: str = "PENDING"
+
+
+@dataclass(frozen=True)
 class RAAEEngineResult:
     """Complete result returned by the RAAE Engine."""
 
@@ -106,6 +122,10 @@ class RAAEEngineResult:
     held_resources: Tuple[Resource, ...]
     conflict_decision: ConflictDecision
     eviction_decision: EvictionDecision
+    released_resource_ids: Tuple[str, ...] = field(default_factory=tuple)
+    memory_released: int = 0
+    eviction_event: Optional[EvictionEvent] = None
+    persisted_event_id: Optional[int] = None
 
     @property
     def decision_type(self) -> EvictionDecisionType:
@@ -114,3 +134,7 @@ class RAAEEngineResult:
     @property
     def can_evict(self) -> bool:
         return self.eviction_decision.can_evict
+
+    @property
+    def eviction_performed(self) -> bool:
+        return self.eviction_event is not None and self.eviction_event.result == "EVICTED"

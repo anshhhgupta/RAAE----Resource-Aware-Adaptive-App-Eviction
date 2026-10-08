@@ -107,6 +107,15 @@ class TestDatabaseManager(unittest.TestCase):
         self.assertEqual(retrieved.status, AppStatus.EVICTED)
         self.assertTrue(retrieved.is_evicted)
 
+    def test_transaction_rolls_back_repository_operations(self):
+        """Test that repository operations inside a transaction roll back atomically."""
+        with self.assertRaises(RuntimeError):
+            with self.db.transaction():
+                self.db.save_app(App(app_id="app_tx_rollback", name="Rollback App"))
+                raise RuntimeError("force rollback")
+
+        self.assertIsNone(self.db.get_app("app_tx_rollback"))
+
     def test_get_all_apps_and_delete(self):
         """Test fetching all apps and deleting an app."""
         app1 = App(app_id="app_1", name="App 1")
