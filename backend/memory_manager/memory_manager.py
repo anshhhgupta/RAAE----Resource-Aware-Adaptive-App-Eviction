@@ -231,6 +231,17 @@ class MemoryManager:
         self.clock_hand = (idx + 1) % n
         return app, logs
 
+    def evaluate_clock_candidate_with_raae(
+        self,
+        raae_engine: Any
+    ) -> Tuple[Optional[Any], List[Dict[str, Any]]]:
+        """Selects a Clock candidate and asks RAAE Engine for an eviction decision."""
+        candidate, logs = self.clock_step()
+        if candidate is None:
+            return None, logs
+
+        return raae_engine.orchestrate_safe_eviction(candidate), logs
+
     def evict_app(self, app_id: str) -> bool:
         """Evicts an app, resetting its footprint to 0 and transitioning state to EVICTED."""
         app = self.apps.get(str(app_id))
