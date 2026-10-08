@@ -115,8 +115,34 @@ class DatabaseManager:
         self.resources.save(resource)
 
     def get_resource(self, resource_id: str) -> Optional[Resource]:
+feature/ansh-memory-resource
+        """Retrieves a Resource by resource_id from SQLite."""
+        sql = "SELECT * FROM resources WHERE resource_id = ?"
+        if self._shared_conn is not None:
+            row = self._shared_conn.execute(sql, (str(resource_id),)).fetchone()
+        else:
+            with self.get_connection() as conn:
+                row = conn.execute(sql, (str(resource_id),)).fetchone()
+
+        if not row:
+            return None
+        d = dict(row)
+        wq = [x.strip() for x in d["waiting_queue"].split(",") if x.strip()] if d.get("waiting_queue") else []
+        res = Resource(
+            resource_id=d["resource_id"],
+            name=d["name"],
+            capacity=d["capacity"],
+            available_units=d["available_units"],
+            waiting_queue=wq
+        )
+        if d.get("held_by_app_id") and d["available_units"] < d["capacity"]:
+            res.holders[d["held_by_app_id"]] = d["capacity"] - d["available_units"]
+        return res
+
+=======
         """Retrieves a Resource by resource_id."""
         return self.resources.get_by_id(resource_id)
+ main
 
     def log_memory_action(
         self,
@@ -128,6 +154,35 @@ class DatabaseManager:
         timestamp: Optional[float] = None
     ) -> None:
         """Logs a memory allocation or deallocation event."""
+ feature/ansh-memory-resource
+        import time
+        sql = """
+            INSERT INTO memory_logs (app_id, action, memory_before, memory_after, pressure_level, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """
+        params = (app_id, action, before, after, pressure, timestamp if timestamp is not None else time.time())
+        if self._shared_conn is not None:
+            self._shared_conn.execute(sql, params)
+            self._shared_conn.commit()
+        else:
+            with self.get_connection() as conn:
+                conn.execute(sql, params)
+
+    def log_lock_request(self, app_id: str, resource_id: str, status: str) -> None:
+        """Logs a resource lock request event (GRANTED, QUEUED, RELEASED)."""
+        import time
+        sql = """
+            INSERT INTO lock_requests (app_id, resource_id, request_time, status)
+            VALUES (?, ?, ?, ?)
+        """
+        params = (str(app_id), str(resource_id), time.time(), str(status))
+        if self._shared_conn is not None:
+            self._shared_conn.execute(sql, params)
+            self._shared_conn.commit()
+        else:
+            with self.get_connection() as conn:
+                conn.execute(sql, params)
+=======
         self.memory_events.log_event(
             app_id=app_id,
             action=action,
@@ -136,6 +191,68 @@ class DatabaseManager:
             pressure_level=pressure,
             timestamp=timestamp
         )
+ main
+
+    def log_memory_pressure(self, pressure_level: str, memory_used: int, total_memory: int) -> None:
+        """Logs a memory pressure detection event."""
+        import time
+        sql = """
+            INSERT INTO memory_logs (app_id, action, memory_before, memory_after, pressure_level, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """
+        params = ("SYSTEM", "PRESSURE_DETECTED", memory_used, total_memory, str(pressure_level), time.time())
+        if self._shared_conn is not None:
+            self._shared_conn.execute(sql, params)
+            self._shared_conn.commit()
+        else:
+            with self.get_connection() as conn:
+                conn.execute(sql, params)
+
+    def get_all_resources(self) -> List[Resource]:
+        """Retrieves all Resource records from SQLite."""
+        sql = "SELECT * FROM resources"
+        if self._shared_conn is not None:
+            rows = self._shared_conn.execute(sql).fetchall()
+        else:
+            with self.get_connection() as conn:
+                rows = conn.execute(sql).fetchall()
+
+        resources = []
+        for row in rows:
+            d = dict(row)
+            wq = [x.strip() for x in d["waiting_queue"].split(",") if x.strip()] if d.get("waiting_queue") else []
+            res = Resource(
+                resource_id=d["resource_id"],
+                name=d["name"],
+                capacity=d["capacity"],
+                available_units=d["available_units"],
+                waiting_queue=wq
+            )
+            if d.get("held_by_app_id") and d["available_units"] < d["capacity"]:
+                res.holders[d["held_by_app_id"]] = d["capacity"] - d["available_units"]
+            resources.append(res)
+
+        return resources
+
+    def get_all_lock_requests(self) -> List[Dict[str, Any]]:
+        """Retrieves all lock_request log records."""
+        sql = "SELECT * FROM lock_requests"
+        if self._shared_conn is not None:
+            rows = self._shared_conn.execute(sql).fetchall()
+        else:
+            with self.get_connection() as conn:
+                rows = conn.execute(sql).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_all_memory_logs(self) -> List[Dict[str, Any]]:
+        """Retrieves all memory log records."""
+        sql = "SELECT * FROM memory_logs"
+        if self._shared_conn is not None:
+            rows = self._shared_conn.execute(sql).fetchall()
+        else:
+            with self.get_connection() as conn:
+                rows = conn.execute(sql).fetchall()
+        return [dict(row) for row in rows]
 
     def close(self) -> None:
         """Closes any open shared database connections."""

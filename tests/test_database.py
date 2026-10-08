@@ -133,6 +133,14 @@ class TestDatabaseManager(unittest.TestCase):
         self.assertEqual(retrieved.capacity, 1)
         self.assertEqual(retrieved.waiting_queue, ["app_2", "app_3"])
 
+    def test_log_memory_action_uses_provided_timestamp(self):
+        """Test that a supplied memory action timestamp is persisted."""
+        self.db.log_memory_action("app_1", "ALLOCATE", 100, 150, "GREEN", timestamp=123.5)
+
+        logs = self.db.get_all_memory_logs()
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0]["timestamp"], 123.5)
+
     def test_resource_locks_repository(self):
         """Test acquiring and releasing resource locks via ResourceLockRepository."""
         app = App(app_id="app_lock_1", name="Navigator")
@@ -211,6 +219,7 @@ class TestDatabaseManager(unittest.TestCase):
         self.assertEqual(len(conflicts), 1)
         self.assertEqual(conflicts[0]["waiting_app_id"], "app_conf_2")
         self.assertEqual(conflicts[0]["blocking_app_id"], "app_conf_1")
+
 
 
 if __name__ == "__main__":
