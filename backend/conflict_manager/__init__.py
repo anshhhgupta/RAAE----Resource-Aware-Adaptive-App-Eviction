@@ -5,6 +5,7 @@ from backend.conflict_manager.conflict_manager import (
     ConflictDecision,
     ConflictResult,
     WOUND_HOLDER,
+    WOUND,
     WAIT,
     NO_CONFLICT,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "ConflictDecision",
     "ConflictResult",
     "WOUND_HOLDER",
+    "WOUND",
     "WAIT",
     "NO_CONFLICT",
 ]
