@@ -18,8 +18,16 @@ from .runner import (
     run_deterministic_comparison,
     setup_deterministic_simulation,
 )
+from .controller import (
+    AppSpec,
+    SimulationController,
+    SimulationResult,
+    Workload,
+    run_simulation,
+)
 
 __all__ = [
+    "AppSpec",
     "BaselineClockPolicy",
     "EvictionPolicy",
     "EvictionPolicyDecision",
@@ -27,9 +35,13 @@ __all__ = [
     "EvictionPolicyType",
     "RAAEEvictionPolicy",
     "SimulationConfig",
+    "SimulationController",
     "SimulationEngine",
     "SimulationMetrics",
+    "SimulationResult",
     "SimulationTickResult",
+    "Workload",
     "run_deterministic_comparison",
+    "run_simulation",
     "setup_deterministic_simulation",
 ]

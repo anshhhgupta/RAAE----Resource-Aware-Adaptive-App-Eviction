@@ -11,8 +11,11 @@ from backend.simulation_engine import (
     EvictionPolicyType,
     RAAEEvictionPolicy,
     SimulationConfig,
+    SimulationController,
     SimulationEngine,
+    Workload,
     run_deterministic_comparison,
+    run_simulation,
     setup_deterministic_simulation,
 )
 from database.db import DatabaseManager
@@ -265,6 +268,90 @@ class TestSimulationEngine(unittest.TestCase):
         ]:
             self.assertIn(key, baseline["metrics"])
             self.assertIn(key, raae["metrics"])
+
+    def test_run_simulation_function(self):
+        """Validates that run_simulation(policy, workload) returns structured results with required fields."""
+        workload = Workload.deterministic_5_apps()
+
+        # Run A: BASELINE_CLOCK
+        res_a = run_simulation("BASELINE_CLOCK", workload)
+
+        # Run B: RAAE
+        res_b = run_simulation("RAAE", workload)
+        repeated_raae = run_simulation("RAAE", workload)
+        self.assertEqual(res_b.to_dict(), repeated_raae.to_dict())
+
+        # Verify structured result fields required by specification
+        for res in [res_a, res_b]:
+            self.assertIn("eviction_count", res)
+            self.assertIn("blocked_waiting_evictions", res)
+            self.assertIn("resource_conflicts", res)
+            self.assertIn("freeze_incidents", res)
+            self.assertIn("conflict_resolution_time", res)
+            self.assertIn("resource_releases", res)
+            # Check attribute access as well
+            self.assertIsInstance(res.eviction_count, int)
+            self.assertIsInstance(res.blocked_waiting_evictions, int)
+            self.assertIsInstance(res.resource_conflicts, int)
+            self.assertIsInstance(res.freeze_incidents, int)
+            self.assertIsInstance(res.conflict_resolution_time, float)
+            self.assertIsInstance(res.resource_releases, int)
+
+        # Verify Baseline metrics: Blind kill of Maps
+        self.assertEqual(res_a.eviction_count, 1)
+        self.assertEqual(res_a.blocked_waiting_evictions, 0)
+        self.assertEqual(res_a.freeze_incidents, 1)
+        self.assertEqual(res_a.resource_releases, 0)
+        self.assertIn("Maps", res_a.evicted_apps)
+
+        # Verify RAAE metrics: Maps protected, Music Player safely released and evicted
+        self.assertEqual(res_b.eviction_count, 1)
+        self.assertEqual(res_b.blocked_waiting_evictions, 1)
+        self.assertEqual(res_b.freeze_incidents, 0)
+        self.assertEqual(res_b.resource_releases, 1)
+        self.assertIn("Maps", res_b.active_apps)
+        self.assertIn("Music Player", res_b.evicted_apps)
+        self.assertGreater(res_b.conflict_resolution_time, 0.0)
+
+    def test_run_simulation_default_workload(self):
+        """Validates that run_simulation(policy) works with default workload when omitted."""
+        res = run_simulation("RAAE")
+        self.assertEqual(res.policy, "RAAE")
+        self.assertEqual(res.freeze_incidents, 0)
+        self.assertEqual(res.blocked_waiting_evictions, 1)
+        self.assertEqual(res.resource_releases, 1)
+
+    def test_run_simulation_uses_mapping_workload(self):
+        """A mapping workload initializes its specified apps rather than the default workload."""
+        workload = {
+            "total_memory": 500,
+            "pressure_threshold": 80.0,
+            "apps": [
+                {
+                    "app_id": "custom_app",
+                    "name": "Custom App",
+                    "memory_footprint": 100,
+                    "reference_bit": 1,
+                }
+            ],
+        }
+
+        result = run_simulation("BASELINE_CLOCK", workload)
+
+        self.assertEqual(result.active_apps, ["Custom App"])
+        self.assertEqual(result.final_memory_used, 100)
+        self.assertEqual(result.total_ticks, 1)
+
+    def test_unknown_policy_and_zero_ticks_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unknown policy"):
+            run_simulation("NOT_A_POLICY")
+
+        controller = SimulationController("RAAE", Workload.deterministic_5_apps())
+        try:
+            with self.assertRaisesRegex(ValueError, "ticks must be a positive integer"):
+                controller.run(ticks=0)
+        finally:
+            controller.close()
 
 
 if __name__ == "__main__":
