@@ -3,11 +3,14 @@
 import unittest
 from backend.models.app import App, AppState
 from backend.models.resource import Resource, ResourceStatus
+from backend.resource_manager.resource_manager import ResourceManager
+from backend.memory_manager.memory_manager import MemoryManager
 from backend.conflict_manager import (
     ConflictManager,
     ConflictDecision,
     ConflictResult,
     WOUND_HOLDER,
+    WOUND,
     WAIT,
     NO_CONFLICT
 )
@@ -290,6 +293,275 @@ class TestConflictManager(unittest.TestCase):
         self.assertEqual(conflicts[0]["resource_id"], "GPS")
         self.assertEqual(conflicts[0]["resolved_by"], "WOUND")
 
+    def test_older_requester_vs_younger_holder(self):
+        """Test Case 1: Older requester conflicts with younger holder -> WOUND younger holder."""
+        # 1a. Older by timestamp (earlier timestamp)
+        result_ts = self.cm.resolve_conflict(
+            requester="app_older",
+            requester_timestamp=100.0,
+            holder="app_younger",
+            holder_timestamp=200.0,
+            resource="GPS"
+        )
+        self.assertEqual(result_ts.decision, ConflictDecision.WOUND_HOLDER)
+        self.assertEqual(result_ts.decision, WOUND)
+        self.assertTrue(result_ts.is_wound)
+        self.assertFalse(result_ts.is_wait)
+        self.assertEqual(result_ts.requester, "app_older")
+        self.assertEqual(result_ts.holder, "app_younger")
+        self.assertEqual(result_ts.resource, "GPS")
+        self.assertIn("older than", result_ts.reason)
+        self.assertIsInstance(result_ts.resolution_timestamp, float)
+
+        # 1b. Older/higher by priority
+        result_p = self.cm.resolve_conflict(
+            requester="app_high_prio",
+            requester_priority=5,
+            holder="app_low_prio",
+            holder_priority=2,
+            resource="MIC"
+        )
+        self.assertEqual(result_p.decision, ConflictDecision.WOUND_HOLDER)
+        self.assertTrue(result_p.is_wound)
+        self.assertEqual(result_p.requester, "app_high_prio")
+        self.assertEqual(result_p.holder, "app_low_prio")
+        self.assertEqual(result_p.resource, "MIC")
+        self.assertIn("Holder wounded", result_p.reason)
+
+    def test_younger_requester_vs_older_holder(self):
+        """Test Case 2: Younger requester conflicts with older holder -> WAIT."""
+        # 2a. Younger by timestamp (later timestamp)
+        result_ts = self.cm.resolve_conflict(
+            requester="app_younger",
+            requester_timestamp=350.0,
+            holder="app_older",
+            holder_timestamp=120.0,
+            resource="GPS"
+        )
+        self.assertEqual(result_ts.decision, ConflictDecision.WAIT)
+        self.assertEqual(result_ts.decision, WAIT)
+        self.assertTrue(result_ts.is_wait)
+        self.assertFalse(result_ts.is_wound)
+        self.assertEqual(result_ts.requester, "app_younger")
+        self.assertEqual(result_ts.holder, "app_older")
+        self.assertEqual(result_ts.resource, "GPS")
+        self.assertIn("is younger than", result_ts.reason)
+        self.assertIn("must wait", result_ts.reason)
+        self.assertIsInstance(result_ts.resolution_timestamp, float)
+
+        # 2b. Younger/lower by priority
+        result_p = self.cm.resolve_conflict(
+            requester="app_low_prio",
+            requester_priority=1,
+            holder="app_high_prio",
+            holder_priority=4,
+            resource="MIC"
+        )
+        self.assertEqual(result_p.decision, ConflictDecision.WAIT)
+        self.assertTrue(result_p.is_wait)
+        self.assertEqual(result_p.requester, "app_low_prio")
+        self.assertEqual(result_p.holder, "app_high_prio")
+        self.assertEqual(result_p.resource, "MIC")
+        self.assertIn("must wait", result_p.reason)
+
+    def test_equal_priority_and_timestamp(self):
+        """Test Case 3: Equal priority and equal timestamp -> WAIT deterministically."""
+        # Both priority and timestamp identical
+        result = self.cm.resolve_conflict(
+            requester="app_req",
+            requester_priority=3,
+            requester_timestamp=500.0,
+            holder="app_hold",
+            holder_priority=3,
+            holder_timestamp=500.0,
+            resource="DB_LOCK"
+        )
+        self.assertEqual(result.decision, ConflictDecision.WAIT)
+        self.assertTrue(result.is_wait)
+        self.assertFalse(result.is_wound)
+        self.assertEqual(result.requester, "app_req")
+        self.assertEqual(result.holder, "app_hold")
+        self.assertEqual(result.resource, "DB_LOCK")
+        self.assertIn("equal precedence", result.reason)
+        self.assertIn("must wait", result.reason)
+
+        # Determinism check: swapping order or repeating yields identical outcome
+        result_rev = self.cm.resolve_conflict(
+            requester="app_hold",
+            requester_priority=3,
+            requester_timestamp=500.0,
+            holder="app_req",
+            holder_priority=3,
+            holder_timestamp=500.0,
+            resource="DB_LOCK"
+        )
+        self.assertEqual(result_rev.decision, ConflictDecision.WAIT)
+        self.assertTrue(result_rev.is_wait)
+
+    def test_no_conflict_scenarios(self):
+        """Test Case 4: No conflict situations produce NO_CONFLICT."""
+        # 4a. Resource is None
+        r1 = self.cm.resolve_conflict(requester="app_1", holder="app_2", resource=None)
+        self.assertEqual(r1.decision, ConflictDecision.NO_CONFLICT)
+        self.assertTrue(r1.is_no_conflict)
+        self.assertIn("No requested resource", r1.reason)
+
+        # 4b. Resource is free (no current holder)
+        r2 = self.cm.resolve_conflict(requester="app_1", holder=None, resource="GPS")
+        self.assertEqual(r2.decision, ConflictDecision.NO_CONFLICT)
+        self.assertTrue(r2.is_no_conflict)
+        self.assertIn("resource is free", r2.reason)
+
+        # 4c. Requester already holds the resource
+        r3 = self.cm.resolve_conflict(requester="app_1", holder="app_1", resource="GPS")
+        self.assertEqual(r3.decision, ConflictDecision.NO_CONFLICT)
+        self.assertTrue(r3.is_no_conflict)
+        self.assertIn("already holds", r3.reason)
+
+        # 4d. Holder App does not hold the requested resource
+        holder_app = App(app_id="app_h", name="Holder", held_resources={"MIC"})
+        requester_app = App(app_id="app_r", name="Requester", priority=3)
+        r4 = self.cm.resolve_conflict(requester=requester_app, holder=holder_app, resource="GPS")
+        self.assertEqual(r4.decision, ConflictDecision.NO_CONFLICT)
+        self.assertTrue(r4.is_no_conflict)
+        self.assertIn("does not hold", r4.reason)
+
+        # 4e. Resource object has available capacity
+        res_obj = Resource(resource_id="FILE_LOCK", name="File", capacity=2, available_units=1)
+        r5 = self.cm.resolve_conflict(requester="app_1", holder="app_2", resource=res_obj)
+        self.assertEqual(r5.decision, ConflictDecision.NO_CONFLICT)
+        self.assertTrue(r5.is_no_conflict)
+
+    def test_structured_results_contents(self):
+        """Verify structured ConflictResult contains all required fields:
+        decision, requester, holder, resource, reason, resolution timestamp.
+        """
+        fixed_ts = 1700000000.0
+        result = self.cm.resolve_conflict(
+            requester="app_older",
+            requester_priority=4,
+            holder="app_younger",
+            holder_priority=1,
+            resource="GPS",
+            resolution_timestamp=fixed_ts
+        )
+
+        # Attribute access
+        self.assertEqual(result.decision, ConflictDecision.WOUND_HOLDER)
+        self.assertEqual(result.requester, "app_older")
+        self.assertEqual(result.holder, "app_younger")
+        self.assertEqual(result.resource, "GPS")
+        self.assertIn("Holder wounded", result.reason)
+        self.assertEqual(result.resolution_timestamp, fixed_ts)
+
+        # Dictionary-style key access
+        self.assertEqual(result["decision"], "WOUND_HOLDER")
+        self.assertEqual(result["requester"], "app_older")
+        self.assertEqual(result["holder"], "app_younger")
+        self.assertEqual(result["resource"], "GPS")
+        self.assertEqual(result["reason"], result.reason)
+        self.assertEqual(result["resolution_timestamp"], fixed_ts)
+        self.assertEqual(result["resolution timestamp"], fixed_ts)
+
+        # Serialization to dictionary
+        d = result.to_dict()
+        self.assertIn("decision", d)
+        self.assertIn("requester", d)
+        self.assertIn("holder", d)
+        self.assertIn("resource", d)
+        self.assertIn("reason", d)
+        self.assertIn("resolution_timestamp", d)
+        self.assertEqual(d["decision"], "WOUND_HOLDER")
+        self.assertEqual(d["requester"], "app_older")
+        self.assertEqual(d["holder"], "app_younger")
+        self.assertEqual(d["resource"], "GPS")
+        self.assertEqual(d["resolution_timestamp"], fixed_ts)
+
+    def test_resource_manager_release_interface(self):
+        """Conflict Manager may request resource release through the Resource Manager interface."""
+        rm = ResourceManager()
+        rm.create_default_resources()
+
+        holder_app = App(app_id="holder_1", name="YoungApp", priority=1, last_access_time=200.0)
+        requester_app = App(app_id="req_1", name="OldApp", priority=4, last_access_time=100.0)
+
+        # Holder acquires GPS
+        acquired = rm.acquire_resource(holder_app, "GPS")
+        self.assertTrue(acquired)
+        self.assertIn("GPS", holder_app.held_resources)
+        gps = rm.get_resource("GPS")
+        self.assertIn("holder_1", gps.holders)
+
+        # Conflict Manager resolves conflict and requests release through ResourceManager interface
+        cm = ConflictManager(resource_manager=rm)
+        result = cm.resolve_conflict(
+            requester=requester_app,
+            holder=holder_app,
+            resource="GPS",
+            request_release=True
+        )
+
+        self.assertEqual(result.decision, ConflictDecision.WOUND_HOLDER)
+        self.assertTrue(result.resource_released)
+
+        # Verify GPS was released through ResourceManager interface
+        self.assertNotIn("GPS", holder_app.held_resources)
+        self.assertNotIn("holder_1", gps.holders)
+        self.assertEqual(gps.available_units, 1)
+
+    def test_conflict_manager_never_manipulates_memory_logic(self):
+        """Conflict Manager must never directly manipulate unrelated memory logic."""
+        mem_mgr = MemoryManager(total_memory=1024)
+        app1 = App(app_id="app_1", name="App1", memory_footprint=200, reference_bit=1, held_resources={"GPS"})
+        app2 = App(app_id="app_2", name="App2", memory_footprint=300, reference_bit=1)
+        mem_mgr.register_app(app1)
+        mem_mgr.register_app(app2)
+
+        initial_used_memory = mem_mgr.get_used_memory()
+        initial_clock_hand = mem_mgr.clock_hand
+        initial_pressure = mem_mgr.get_pressure_level()
+
+        cm = ConflictManager()
+        # Resolve conflict between app1 and app2
+        result = cm.resolve_conflict(
+            requester=app2,
+            requester_priority=5,
+            holder=app1,
+            holder_priority=1,
+            resource="GPS"
+        )
+        self.assertEqual(result.decision, ConflictDecision.WOUND_HOLDER)
+
+        # Verify memory manager state is completely unchanged
+        self.assertEqual(mem_mgr.get_used_memory(), initial_used_memory)
+        self.assertEqual(mem_mgr.clock_hand, initial_clock_hand)
+        self.assertEqual(mem_mgr.get_pressure_level(), initial_pressure)
+        self.assertEqual(app1.memory_footprint, 200)
+        self.assertEqual(app2.memory_footprint, 300)
+        self.assertFalse(app1.is_evicted)
+        self.assertFalse(app2.is_evicted)
+
+    def test_wound_wait_determinism(self):
+        """Wound-Wait evaluation must be strictly deterministic across repeated runs."""
+        for _ in range(50):
+            res_wound = self.cm.resolve_conflict("app_a", 5, "app_b", 1, "GPS")
+            self.assertEqual(res_wound.decision, ConflictDecision.WOUND_HOLDER)
+
+            res_wait = self.cm.resolve_conflict("app_a", 1, "app_b", 5, "GPS")
+            self.assertEqual(res_wait.decision, ConflictDecision.WAIT)
+
+            res_eq = self.cm.resolve_conflict(
+                requester="app_a",
+                requester_priority=2,
+                requester_timestamp=100.0,
+                holder="app_b",
+                holder_priority=2,
+                holder_timestamp=100.0,
+                resource="GPS"
+            )
+            self.assertEqual(res_eq.decision, ConflictDecision.WAIT)
+
 
 if __name__ == "__main__":
     unittest.main()
+
