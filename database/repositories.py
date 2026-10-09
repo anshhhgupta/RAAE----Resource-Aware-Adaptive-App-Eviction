@@ -1,41 +1,173 @@
-"""Repository classes for RAAE persistence layer.
+"""Repository classes for the RAAE repository / data-access layer.
 
-Provides clean CRUD and query interfaces for all 6 database tables:
+Every SQL statement in the project lives in this package. Repositories own
+parameterized queries for each of the 6 tables defined in ``schema.sql``:
+
 1. Apps
 2. Resources
 3. ResourceLocks
 4. MemoryEvents
 5. EvictionLog
 6. ConflictLog
+
+Naming follows the canonical data-access API: ``create_*`` inserts a new row,
+``update_*`` mutates an existing row, ``get_*`` reads, and ``delete_*`` removes.
+Older names (``save``, ``get_by_id``, ``log_event``, ...) are kept as thin
+aliases so existing backend callers keep working.
 """
 
-import time
 import sqlite3
-from typing import List, Optional, Dict, Any, Union
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
 from backend.models.app import App, AppState, AppStatus
 from backend.models.resource import Resource, ResourceStatus
 
 
+def _encode_csv(values: Sequence[str]) -> str:
+    """Serializes a collection of strings into the comma-separated TEXT layout used by the schema."""
+    return ",".join(str(v) for v in values)
+
+
+def _decode_csv(raw: Optional[str]) -> List[str]:
+    """Deserializes a comma-separated TEXT column into a list of strings."""
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _app_state_value(state: Union[AppState, str]) -> str:
+    """Normalizes an AppState enum or string into its TEXT column value."""
+    return state.value if isinstance(state, AppState) else str(state)
+
+
+def _app_status_value(status: Union[AppStatus, str]) -> str:
+    """Normalizes an AppStatus enum or string into its TEXT column value."""
+    return status.value if isinstance(status, AppStatus) else str(status)
+
+
+def _resource_status_value(status: Union[ResourceStatus, str]) -> str:
+    """Normalizes a ResourceStatus enum or string into its TEXT column value."""
+    return status.value if isinstance(status, ResourceStatus) else str(status)
+
+
+def _bool_to_int(value: Any) -> int:
+    """Normalizes a boolean-like value into the INTEGER 0/1 layout used by the schema."""
+    return 1 if value else 0
+
+
+def _resource_from_row(row: Any) -> Resource:
+    """Rebuilds a Resource model from a Resources row.
+
+    ``Resources`` stores a single ``held_by_app_id`` plus ``available_units``, so the
+    ``holders`` map is reconstructed from the units a resource has handed out.
+    """
+    data = dict(row)
+    resource = Resource(
+        resource_id=data["resource_id"],
+        name=data["name"],
+        capacity=data["capacity"],
+        available_units=data["available_units"],
+        waiting_queue=_decode_csv(data.get("waiting_queue")),
+    )
+
+    holder_id = data.get("held_by_app_id")
+    if holder_id and data["available_units"] < data["capacity"]:
+        resource.holders[str(holder_id)] = data["capacity"] - data["available_units"]
+
+    return resource
+
+
 class BaseRepository:
-    """Base repository with database connection management."""
+    """Base repository providing connection access for derived repositories.
+
+    Attributes:
+        db (Any): Owning DatabaseManager used to obtain SQLite connections.
+    """
 
     def __init__(self, db_manager: Any) -> None:
         self.db = db_manager
 
-    def _get_connection(self) -> sqlite3.Connection:
+    def _get_connection(self) -> Any:
+        """Returns a connection from the owning DatabaseManager."""
         return self.db.get_connection()
+
+    def _execute(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Cursor:
+        """Executes a parameterized statement on the managed connection."""
+        with self._get_connection() as conn:
+            return conn.execute(sql, tuple(params))
+
+    def _execute_many_read(self, sql: str, params: Sequence[Any] = ()) -> List[Dict[str, Any]]:
+        """Executes a parameterized query and returns all rows as dictionaries."""
+        with self._get_connection() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
 
 
 class AppRepository(BaseRepository):
-    """Repository for managing Apps persistence in SQLite."""
+    """Repository for Apps persistence."""
+
+    _COLUMNS = (
+        "app_id, name, priority, state, memory_footprint, "
+        "reference_bit, last_access_time, held_resources, status"
+    )
+
+    def _to_params(self, app: App) -> Tuple[Any, ...]:
+        """Converts an App model into a flat parameter tuple matching _COLUMNS."""
+        return (
+            str(app.app_id),
+            app.name,
+            int(app.priority),
+            _app_state_value(app.state),
+            int(app.memory_footprint),
+            int(app.reference_bit),
+            float(app.last_access_time),
+            _encode_csv(sorted(app.held_resources)),
+            _app_status_value(app.status),
+        )
+
+    def _to_update_params(self, app: App) -> Tuple[Any, ...]:
+        """Converts an App model into a parameter tuple for an UPDATE, keyed last."""
+        params = self._to_params(app)
+        return params[1:] + (params[0],)
+
+    def create_app(self, app: App) -> App:
+        """Inserts a new App record.
+
+        Args:
+            app (App): Application model to persist.
+
+        Returns:
+            App: The persisted application.
+
+        Raises:
+            sqlite3.IntegrityError: If an App with the same app_id already exists.
+        """
+        sql = f"INSERT INTO Apps ({self._COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        self._execute(sql, self._to_params(app))
+        return app
+
+    def update_app(self, app: App) -> bool:
+        """Updates an existing App record.
+
+        Args:
+            app (App): Application model carrying the new column values.
+
+        Returns:
+            bool: True if a row was updated, False if no App matched app_id.
+        """
+        sql = """
+            UPDATE Apps
+            SET name = ?, priority = ?, state = ?, memory_footprint = ?,
+                reference_bit = ?, last_access_time = ?, held_resources = ?, status = ?
+            WHERE app_id = ?
+        """
+        return self._execute(sql, self._to_update_params(app)).rowcount > 0
 
     def save(self, app: App) -> None:
-        """Inserts or updates an App record in SQLite."""
-        sql = """
-            INSERT INTO Apps (
-                app_id, name, priority, state, memory_footprint,
-                reference_bit, last_access_time, held_resources, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """Inserts or updates an App record (upsert on app_id)."""
+        sql = f"""
+            INSERT INTO Apps ({self._COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(app_id) DO UPDATE SET
                 name=excluded.name,
                 priority=excluded.priority,
@@ -46,86 +178,174 @@ class AppRepository(BaseRepository):
                 held_resources=excluded.held_resources,
                 status=excluded.status;
         """
-        held_str = ",".join(sorted(list(app.held_resources)))
-        params = (
-            str(app.app_id),
-            app.name,
-            app.priority,
-            app.state.value if isinstance(app.state, AppState) else str(app.state),
-            app.memory_footprint,
-            app.reference_bit,
-            app.last_access_time,
-            held_str,
-            app.status.value if isinstance(app.status, AppStatus) else str(app.status)
-        )
-        with self._get_connection() as conn:
-            conn.execute(sql, params)
+        self._execute(sql, self._to_params(app))
 
-    def get_by_id(self, app_id: str) -> Optional[App]:
-        """Retrieves an App by app_id from SQLite."""
+    def get_app(self, app_id: str) -> Optional[App]:
+        """Retrieves a single App by app_id.
+
+        Args:
+            app_id (str): Application identifier.
+
+        Returns:
+            Optional[App]: The App, or None if no row matched.
+        """
         sql = "SELECT * FROM Apps WHERE app_id = ?"
         with self._get_connection() as conn:
             row = conn.execute(sql, (str(app_id),)).fetchone()
-        if not row:
-            return None
-        return App.from_dict(dict(row))
+        return App.from_dict(dict(row)) if row else None
 
-    def get_all(self) -> List[App]:
-        """Retrieves all App records from SQLite."""
-        sql = "SELECT * FROM Apps ORDER BY priority DESC, app_id ASC"
+    def get_all_apps(self, status: Optional[Union[AppStatus, str]] = None) -> List[App]:
+        """Retrieves all Apps, optionally filtered by status.
+
+        Args:
+            status (Optional[Union[AppStatus, str]]): Restricts results to a single status.
+
+        Returns:
+            List[App]: Apps ordered by descending priority then app_id.
+        """
+        if status is None:
+            sql = "SELECT * FROM Apps ORDER BY priority DESC, app_id ASC"
+            params: Tuple[Any, ...] = ()
+        else:
+            sql = "SELECT * FROM Apps WHERE status = ? ORDER BY priority DESC, app_id ASC"
+            params = (_app_status_value(status),)
+
         with self._get_connection() as conn:
-            rows = conn.execute(sql).fetchall()
+            rows = conn.execute(sql, params).fetchall()
         return [App.from_dict(dict(row)) for row in rows]
 
+    def delete_app(self, app_id: str) -> bool:
+        """Deletes an App by app_id.
+
+        Related ResourceLocks, MemoryEvents, EvictionLog and ConflictLog rows are
+        removed by the schema's ON DELETE CASCADE rules.
+
+        Args:
+            app_id (str): Application identifier.
+
+        Returns:
+            bool: True if a row was deleted, False if no App matched.
+        """
+        sql = "DELETE FROM Apps WHERE app_id = ?"
+        return self._execute(sql, (str(app_id),)).rowcount > 0
+
     def get_active(self) -> List[App]:
-        """Retrieves active (non-evicted) App records."""
+        """Retrieves Apps that are neither evicted in state nor status."""
         sql = "SELECT * FROM Apps WHERE status = 'ACTIVE' AND state != 'EVICTED' ORDER BY priority DESC"
         with self._get_connection() as conn:
             rows = conn.execute(sql).fetchall()
         return [App.from_dict(dict(row)) for row in rows]
 
     def get_by_state(self, state: Union[AppState, str]) -> List[App]:
-        """Retrieves apps by state (e.g. FOREGROUND, BACKGROUND, WAITING)."""
-        state_val = state.value if isinstance(state, AppState) else str(state)
-        sql = "SELECT * FROM Apps WHERE state = ?"
+        """Retrieves Apps matching a given execution state."""
+        sql = "SELECT * FROM Apps WHERE state = ? ORDER BY priority DESC"
         with self._get_connection() as conn:
-            rows = conn.execute(sql, (state_val,)).fetchall()
+            rows = conn.execute(sql, (_app_state_value(state),)).fetchall()
         return [App.from_dict(dict(row)) for row in rows]
 
-    def delete(self, app_id: str) -> bool:
-        """Deletes an App record by app_id."""
-        sql = "DELETE FROM Apps WHERE app_id = ?"
-        with self._get_connection() as conn:
-            cursor = conn.execute(sql, (str(app_id),))
-            return cursor.rowcount > 0
+    def update_state(
+        self,
+        app_id: str,
+        state: Union[AppState, str],
+        status: Optional[Union[AppStatus, str]] = None,
+    ) -> bool:
+        """Updates an App's state, status and last access time.
 
-    def update_state(self, app_id: str, state: Union[AppState, str], status: Optional[Union[AppStatus, str]] = None) -> bool:
-        """Updates the state and status of an App."""
-        state_val = state.value if isinstance(state, AppState) else str(state)
+        Args:
+            app_id (str): Application identifier.
+            state (Union[AppState, str]): New execution state.
+            status (Optional[Union[AppStatus, str]]): New status; derived from state when omitted.
+
+        Returns:
+            bool: True if a row was updated, False if no App matched.
+        """
+        state_val = _app_state_value(state)
         if status is None:
-            status_val = "EVICTED" if state_val == "EVICTED" else "ACTIVE"
+            status_val = "EVICTED" if state_val == AppState.EVICTED.value else "ACTIVE"
         else:
-            status_val = status.value if isinstance(status, AppStatus) else str(status)
+            status_val = _app_status_value(status)
 
         sql = """
-            UPDATE Apps 
+            UPDATE Apps
             SET state = ?, status = ?, last_access_time = ?
             WHERE app_id = ?
         """
-        with self._get_connection() as conn:
-            cursor = conn.execute(sql, (state_val, status_val, time.time(), str(app_id)))
-            return cursor.rowcount > 0
+        return self._execute(sql, (state_val, status_val, time.time(), str(app_id))).rowcount > 0
+
+    def get_by_id(self, app_id: str) -> Optional[App]:
+        """Alias for get_app."""
+        return self.get_app(app_id)
+
+    def get_all(self) -> List[App]:
+        """Alias for get_all_apps."""
+        return self.get_all_apps()
+
+    def delete(self, app_id: str) -> bool:
+        """Alias for delete_app."""
+        return self.delete_app(app_id)
 
 
 class ResourceRepository(BaseRepository):
-    """Repository for managing Resources persistence in SQLite."""
+    """Repository for Resources persistence."""
+
+    _COLUMNS = (
+        "resource_id, name, capacity, available_units, status, held_by_app_id, waiting_queue"
+    )
+
+    def _to_params(self, resource: Resource) -> Tuple[Any, ...]:
+        """Converts a Resource model into a flat parameter tuple matching _COLUMNS."""
+        return (
+            str(resource.resource_id),
+            resource.name,
+            int(resource.capacity),
+            int(resource.available_units),
+            _resource_status_value(resource.status),
+            resource.primary_holder_id,
+            _encode_csv(resource.waiting_queue),
+        )
+
+    def _to_update_params(self, resource: Resource) -> Tuple[Any, ...]:
+        """Converts a Resource model into a parameter tuple for an UPDATE, keyed last."""
+        params = self._to_params(resource)
+        return params[1:] + (params[0],)
+
+    def create_resource(self, resource: Resource) -> Resource:
+        """Inserts a new Resource record.
+
+        Args:
+            resource (Resource): Resource model to persist.
+
+        Returns:
+            Resource: The persisted resource.
+
+        Raises:
+            sqlite3.IntegrityError: If the resource_id exists, or held_by_app_id is unknown.
+        """
+        sql = f"INSERT INTO Resources ({self._COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        self._execute(sql, self._to_params(resource))
+        return resource
+
+    def update_resource(self, resource: Resource) -> bool:
+        """Updates an existing Resource record.
+
+        Args:
+            resource (Resource): Resource model carrying the new column values.
+
+        Returns:
+            bool: True if a row was updated, False if no Resource matched.
+        """
+        sql = """
+            UPDATE Resources
+            SET name = ?, capacity = ?, available_units = ?, status = ?,
+                held_by_app_id = ?, waiting_queue = ?
+            WHERE resource_id = ?
+        """
+        return self._execute(sql, self._to_update_params(resource)).rowcount > 0
 
     def save(self, resource: Resource) -> None:
-        """Inserts or updates a Resource record in SQLite."""
-        sql = """
-            INSERT INTO Resources (
-                resource_id, name, capacity, available_units, status, held_by_app_id, waiting_queue
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """Inserts or updates a Resource record (upsert on resource_id)."""
+        sql = f"""
+            INSERT INTO Resources ({self._COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(resource_id) DO UPDATE SET
                 name=excluded.name,
                 capacity=excluded.capacity,
@@ -134,128 +354,153 @@ class ResourceRepository(BaseRepository):
                 held_by_app_id=excluded.held_by_app_id,
                 waiting_queue=excluded.waiting_queue;
         """
-        waiting_str = ",".join(resource.waiting_queue)
-        params = (
-            str(resource.resource_id),
-            resource.name,
-            resource.capacity,
-            resource.available_units,
-            resource.status.value if isinstance(resource.status, ResourceStatus) else str(resource.status),
-            resource.primary_holder_id,
-            waiting_str
-        )
-        with self._get_connection() as conn:
-            conn.execute(sql, params)
+        self._execute(sql, self._to_params(resource))
 
-    def get_by_id(self, resource_id: str) -> Optional[Resource]:
-        """Retrieves a Resource by resource_id from SQLite."""
+    def get_resource(self, resource_id: str) -> Optional[Resource]:
+        """Retrieves a single Resource by resource_id (case-insensitive).
+
+        Args:
+            resource_id (str): Resource identifier.
+
+        Returns:
+            Optional[Resource]: The Resource, or None if no row matched.
+        """
         sql = "SELECT * FROM Resources WHERE resource_id = ? COLLATE NOCASE"
         with self._get_connection() as conn:
             row = conn.execute(sql, (str(resource_id),)).fetchone()
-        if not row:
-            return None
-        d = dict(row)
-        wq = [x.strip() for x in d["waiting_queue"].split(",") if x.strip()] if d.get("waiting_queue") else []
-        return Resource(
-            resource_id=d["resource_id"],
-            name=d["name"],
-            capacity=d["capacity"],
-            available_units=d["available_units"],
-            waiting_queue=wq
-        )
+        return _resource_from_row(row) if row else None
+
+    def get_resources(
+        self,
+        resource_id: Optional[str] = None,
+        status: Optional[Union[ResourceStatus, str]] = None,
+        held_by_app_id: Optional[str] = None,
+    ) -> List[Resource]:
+        """Retrieves Resources matching the supplied filters.
+
+        Args:
+            resource_id (Optional[str]): Restricts to a single resource_id.
+            status (Optional[Union[ResourceStatus, str]]): Restricts to a single status.
+            held_by_app_id (Optional[str]): Restricts to resources held by this app.
+
+        Returns:
+            List[Resource]: Matching resources ordered by resource_id.
+        """
+        clauses: List[str] = []
+        params: List[Any] = []
+
+        if resource_id is not None:
+            clauses.append("resource_id = ? COLLATE NOCASE")
+            params.append(str(resource_id))
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(_resource_status_value(status))
+        if held_by_app_id is not None:
+            clauses.append("held_by_app_id = ?")
+            params.append(str(held_by_app_id))
+
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"SELECT * FROM Resources{where} ORDER BY resource_id ASC"
+
+        with self._get_connection() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [_resource_from_row(row) for row in rows]
+
+    def delete_resource(self, resource_id: str) -> bool:
+        """Deletes a Resource by resource_id (case-insensitive)."""
+        sql = "DELETE FROM Resources WHERE resource_id = ? COLLATE NOCASE"
+        return self._execute(sql, (str(resource_id),)).rowcount > 0
+
+    def get_by_id(self, resource_id: str) -> Optional[Resource]:
+        """Alias for get_resource."""
+        return self.get_resource(resource_id)
 
     def get_all(self) -> List[Resource]:
-        """Retrieves all Resource records from SQLite."""
-        sql = "SELECT * FROM Resources ORDER BY resource_id ASC"
-        with self._get_connection() as conn:
-            rows = conn.execute(sql).fetchall()
-        result = []
-        for row in rows:
-            d = dict(row)
-            wq = [x.strip() for x in d["waiting_queue"].split(",") if x.strip()] if d.get("waiting_queue") else []
-            result.append(Resource(
-                resource_id=d["resource_id"],
-                name=d["name"],
-                capacity=d["capacity"],
-                available_units=d["available_units"],
-                waiting_queue=wq
-            ))
-        return result
+        """Alias for get_resources with no filters."""
+        return self.get_resources()
 
     def get_by_status(self, status: Union[ResourceStatus, str]) -> List[Resource]:
-        """Retrieves resources filtered by status (FREE, LOCKED, WAITING)."""
-        status_val = status.value if isinstance(status, ResourceStatus) else str(status)
-        sql = "SELECT * FROM Resources WHERE status = ?"
-        with self._get_connection() as conn:
-            rows = conn.execute(sql, (status_val,)).fetchall()
-        result = []
-        for row in rows:
-            d = dict(row)
-            wq = [x.strip() for x in d["waiting_queue"].split(",") if x.strip()] if d.get("waiting_queue") else []
-            result.append(Resource(
-                resource_id=d["resource_id"],
-                name=d["name"],
-                capacity=d["capacity"],
-                available_units=d["available_units"],
-                waiting_queue=wq
-            ))
-        return result
+        """Alias for get_resources filtered by status."""
+        return self.get_resources(status=status)
 
     def delete(self, resource_id: str) -> bool:
-        """Deletes a Resource record by resource_id."""
-        sql = "DELETE FROM Resources WHERE resource_id = ? COLLATE NOCASE"
-        with self._get_connection() as conn:
-            cursor = conn.execute(sql, (str(resource_id),))
-            return cursor.rowcount > 0
+        """Alias for delete_resource."""
+        return self.delete_resource(resource_id)
 
 
 class ResourceLockRepository(BaseRepository):
-    """Repository for managing ResourceLocks records in SQLite."""
+    """Repository for ResourceLocks persistence."""
 
-    def acquire_lock(
+    def acquire_resource_lock(
         self,
         app_id: str,
         resource_id: str,
         units: int = 1,
         status: str = "HELD",
-        acquired_at: Optional[float] = None
+        acquired_at: Optional[float] = None,
     ) -> int:
-        """Records a new resource lock acquisition."""
+        """Records a resource lock acquisition.
+
+        Args:
+            app_id (str): Application acquiring the lock.
+            resource_id (str): Resource being locked.
+            units (int): Number of units held.
+            status (str): Lock status; 'HELD' for an active lock.
+            acquired_at (Optional[float]): Acquisition timestamp; defaults to now.
+
+        Returns:
+            int: The new lock_id.
+
+        Raises:
+            sqlite3.IntegrityError: If app_id or resource_id violates a foreign key.
+        """
         sql = """
             INSERT INTO ResourceLocks (app_id, resource_id, units, status, acquired_at)
             VALUES (?, ?, ?, ?, ?)
         """
         ts = acquired_at if acquired_at is not None else time.time()
-        with self._get_connection() as conn:
-            cursor = conn.execute(sql, (str(app_id), str(resource_id), int(units), str(status), float(ts)))
-            return cursor.lastrowid
+        return self._execute(
+            sql, (str(app_id), str(resource_id), int(units), str(status), float(ts))
+        ).lastrowid
 
-    def release_lock(self, lock_id: int, released_at: Optional[float] = None) -> bool:
-        """Marks a specific resource lock as released."""
+    def release_resource_lock(self, lock_id: int, released_at: Optional[float] = None) -> bool:
+        """Marks a lock as released.
+
+        Args:
+            lock_id (int): Identifier of the lock to release.
+            released_at (Optional[float]): Release timestamp; defaults to now.
+
+        Returns:
+            bool: True if an active lock was transitioned, False otherwise.
+        """
         sql = """
-            UPDATE ResourceLocks 
+            UPDATE ResourceLocks
             SET status = 'RELEASED', released_at = ?
             WHERE lock_id = ? AND status != 'RELEASED'
         """
         ts = released_at if released_at is not None else time.time()
-        with self._get_connection() as conn:
-            cursor = conn.execute(sql, (float(ts), int(lock_id)))
-            return cursor.rowcount > 0
+        return self._execute(sql, (float(ts), int(lock_id))).rowcount > 0
 
     def release_all_for_app(self, app_id: str, released_at: Optional[float] = None) -> int:
-        """Marks all active locks held by an app as released."""
+        """Marks every active lock held by an app as released.
+
+        Args:
+            app_id (str): Application whose locks are released.
+            released_at (Optional[float]): Release timestamp; defaults to now.
+
+        Returns:
+            int: Number of locks transitioned to RELEASED.
+        """
         sql = """
-            UPDATE ResourceLocks 
+            UPDATE ResourceLocks
             SET status = 'RELEASED', released_at = ?
             WHERE app_id = ? AND status = 'HELD'
         """
         ts = released_at if released_at is not None else time.time()
-        with self._get_connection() as conn:
-            cursor = conn.execute(sql, (float(ts), str(app_id)))
-            return cursor.rowcount
+        return self._execute(sql, (float(ts), str(app_id))).rowcount
 
     def get_active_locks(self) -> List[Dict[str, Any]]:
-        """Retrieves all currently active (HELD) resource locks."""
+        """Retrieves all currently held locks joined with app and resource names."""
         sql = """
             SELECT rl.*, a.name AS app_name, r.name AS resource_name
             FROM ResourceLocks rl
@@ -264,27 +509,93 @@ class ResourceLockRepository(BaseRepository):
             WHERE rl.status = 'HELD'
             ORDER BY rl.acquired_at ASC
         """
-        with self._get_connection() as conn:
-            rows = conn.execute(sql).fetchall()
-        return [dict(row) for row in rows]
+        return self._execute_many_read(sql)
 
     def get_locks_by_app(self, app_id: str) -> List[Dict[str, Any]]:
-        """Retrieves all lock history for an app."""
+        """Retrieves full lock history for an app."""
         sql = "SELECT * FROM ResourceLocks WHERE app_id = ? ORDER BY acquired_at DESC"
-        with self._get_connection() as conn:
-            rows = conn.execute(sql, (str(app_id),)).fetchall()
-        return [dict(row) for row in rows]
+        return self._execute_many_read(sql, (str(app_id),))
 
     def get_locks_by_resource(self, resource_id: str) -> List[Dict[str, Any]]:
-        """Retrieves lock records for a specific resource."""
+        """Retrieves full lock history for a resource."""
         sql = "SELECT * FROM ResourceLocks WHERE resource_id = ? ORDER BY acquired_at DESC"
-        with self._get_connection() as conn:
-            rows = conn.execute(sql, (str(resource_id),)).fetchall()
-        return [dict(row) for row in rows]
+        return self._execute_many_read(sql, (str(resource_id),))
+
+    def acquire_lock(
+        self,
+        app_id: str,
+        resource_id: str,
+        units: int = 1,
+        status: str = "HELD",
+        acquired_at: Optional[float] = None,
+    ) -> int:
+        """Alias for acquire_resource_lock."""
+        return self.acquire_resource_lock(app_id, resource_id, units, status, acquired_at)
+
+    def release_lock(self, lock_id: int, released_at: Optional[float] = None) -> bool:
+        """Alias for release_resource_lock."""
+        return self.release_resource_lock(lock_id, released_at)
 
 
 class MemoryEventRepository(BaseRepository):
-    """Repository for managing MemoryEvents records in SQLite."""
+    """Repository for MemoryEvents persistence."""
+
+    def insert_memory_event(
+        self,
+        app_id: str,
+        action: str,
+        memory_before: int,
+        memory_after: int,
+        pressure_level: str,
+        timestamp: Optional[float] = None,
+    ) -> int:
+        """Logs a memory allocation, deallocation or pressure event.
+
+        Args:
+            app_id (str): Application the event belongs to.
+            action (str): Event action, e.g. 'ALLOCATE' or 'DEALLOCATE'.
+            memory_before (int): App memory footprint before the action.
+            memory_after (int): App memory footprint after the action.
+            pressure_level (str): Memory pressure level at event time.
+            timestamp (Optional[float]): Event timestamp; defaults to now.
+
+        Returns:
+            int: The new event_id.
+
+        Raises:
+            sqlite3.IntegrityError: If app_id violates the Apps foreign key.
+        """
+        sql = """
+            INSERT INTO MemoryEvents (app_id, action, memory_before, memory_after, pressure_level, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """
+        ts = timestamp if timestamp is not None else time.time()
+        return self._execute(
+            sql,
+            (
+                str(app_id),
+                str(action),
+                int(memory_before),
+                int(memory_after),
+                str(pressure_level),
+                float(ts),
+            ),
+        ).lastrowid
+
+    def get_events_by_app(self, app_id: str) -> List[Dict[str, Any]]:
+        """Retrieves memory event history for an app, newest first."""
+        sql = "SELECT * FROM MemoryEvents WHERE app_id = ? ORDER BY timestamp DESC"
+        return self._execute_many_read(sql, (str(app_id),))
+
+    def get_events_by_action(self, action: str) -> List[Dict[str, Any]]:
+        """Retrieves memory events of a given action type, newest first."""
+        sql = "SELECT * FROM MemoryEvents WHERE action = ? ORDER BY timestamp DESC"
+        return self._execute_many_read(sql, (str(action),))
+
+    def get_all_events(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Retrieves the most recent memory events, newest first."""
+        sql = "SELECT * FROM MemoryEvents ORDER BY timestamp DESC LIMIT ?"
+        return self._execute_many_read(sql, (int(limit),))
 
     def log_event(
         self,
@@ -293,38 +604,76 @@ class MemoryEventRepository(BaseRepository):
         memory_before: int,
         memory_after: int,
         pressure_level: str,
-        timestamp: Optional[float] = None
+        timestamp: Optional[float] = None,
     ) -> int:
-        """Logs a memory allocation, deallocation, or pressure event."""
-        sql = """
-            INSERT INTO MemoryEvents (app_id, action, memory_before, memory_after, pressure_level, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """
-        ts = timestamp if timestamp is not None else time.time()
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                sql,
-                (str(app_id), str(action), int(memory_before), int(memory_after), str(pressure_level), float(ts))
-            )
-            return cursor.lastrowid
-
-    def get_events_by_app(self, app_id: str) -> List[Dict[str, Any]]:
-        """Retrieves memory event history for an app."""
-        sql = "SELECT * FROM MemoryEvents WHERE app_id = ? ORDER BY timestamp DESC"
-        with self._get_connection() as conn:
-            rows = conn.execute(sql, (str(app_id),)).fetchall()
-        return [dict(row) for row in rows]
-
-    def get_all_events(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """Retrieves recent memory events."""
-        sql = "SELECT * FROM MemoryEvents ORDER BY timestamp DESC LIMIT ?"
-        with self._get_connection() as conn:
-            rows = conn.execute(sql, (int(limit),)).fetchall()
-        return [dict(row) for row in rows]
+        """Alias for insert_memory_event."""
+        return self.insert_memory_event(
+            app_id, action, memory_before, memory_after, pressure_level, timestamp
+        )
 
 
 class EvictionLogRepository(BaseRepository):
-    """Repository for managing EvictionLog records in SQLite."""
+    """Repository for EvictionLog persistence."""
+
+    def insert_eviction_log(
+        self,
+        app_id: str,
+        algorithm: str,
+        reason: str,
+        lock_checked: bool,
+        safe_release: bool,
+        result: str,
+        timestamp: Optional[float] = None,
+    ) -> int:
+        """Logs an eviction decision and its outcome.
+
+        Args:
+            app_id (str): Application considered for eviction.
+            algorithm (str): Algorithm that produced the decision.
+            reason (str): Human readable reason for the decision.
+            lock_checked (bool): Whether held resource locks were inspected.
+            safe_release (bool): Whether releasing the app's locks is safe.
+            result (str): Decision outcome, e.g. 'EVICTED' or 'SKIPPED'.
+            timestamp (Optional[float]): Event timestamp; defaults to now.
+
+        Returns:
+            int: The new event_id.
+
+        Raises:
+            sqlite3.IntegrityError: If app_id violates the Apps foreign key.
+        """
+        sql = """
+            INSERT INTO EvictionLog (app_id, algorithm, reason, lock_checked, safe_release, result, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+        ts = timestamp if timestamp is not None else time.time()
+        return self._execute(
+            sql,
+            (
+                str(app_id),
+                str(algorithm),
+                str(reason),
+                _bool_to_int(lock_checked),
+                _bool_to_int(safe_release),
+                str(result),
+                float(ts),
+            ),
+        ).lastrowid
+
+    def get_evictions_by_app(self, app_id: str) -> List[Dict[str, Any]]:
+        """Retrieves eviction records for an app, newest first."""
+        sql = "SELECT * FROM EvictionLog WHERE app_id = ? ORDER BY timestamp DESC"
+        return self._execute_many_read(sql, (str(app_id),))
+
+    def get_evictions_by_algorithm(self, algorithm: str) -> List[Dict[str, Any]]:
+        """Retrieves eviction records produced by a given algorithm, newest first."""
+        sql = "SELECT * FROM EvictionLog WHERE algorithm = ? ORDER BY timestamp DESC"
+        return self._execute_many_read(sql, (str(algorithm),))
+
+    def get_all_evictions(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Retrieves the most recent eviction records, newest first."""
+        sql = "SELECT * FROM EvictionLog ORDER BY timestamp DESC LIMIT ?"
+        return self._execute_many_read(sql, (int(limit),))
 
     def log_eviction(
         self,
@@ -334,46 +683,83 @@ class EvictionLogRepository(BaseRepository):
         lock_checked: bool,
         safe_release: bool,
         result: str,
-        timestamp: Optional[float] = None
+        timestamp: Optional[float] = None,
     ) -> int:
-        """Logs an application eviction decision and its outcome."""
-        sql = """
-            INSERT INTO EvictionLog (app_id, algorithm, reason, lock_checked, safe_release, result, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """
-        ts = timestamp if timestamp is not None else time.time()
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                sql,
-                (
-                    str(app_id),
-                    str(algorithm),
-                    str(reason),
-                    1 if lock_checked else 0,
-                    1 if safe_release else 0,
-                    str(result),
-                    float(ts)
-                )
-            )
-            return cursor.lastrowid
-
-    def get_evictions_by_app(self, app_id: str) -> List[Dict[str, Any]]:
-        """Retrieves eviction records for a specific app."""
-        sql = "SELECT * FROM EvictionLog WHERE app_id = ? ORDER BY timestamp DESC"
-        with self._get_connection() as conn:
-            rows = conn.execute(sql, (str(app_id),)).fetchall()
-        return [dict(row) for row in rows]
-
-    def get_all_evictions(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """Retrieves recent eviction log entries."""
-        sql = "SELECT * FROM EvictionLog ORDER BY timestamp DESC LIMIT ?"
-        with self._get_connection() as conn:
-            rows = conn.execute(sql, (int(limit),)).fetchall()
-        return [dict(row) for row in rows]
+        """Alias for insert_eviction_log."""
+        return self.insert_eviction_log(
+            app_id, algorithm, reason, lock_checked, safe_release, result, timestamp
+        )
 
 
 class ConflictLogRepository(BaseRepository):
-    """Repository for managing ConflictLog records in SQLite."""
+    """Repository for ConflictLog persistence."""
+
+    def insert_conflict_log(
+        self,
+        waiting_app_id: str,
+        blocking_app_id: str,
+        resource_id: str,
+        resolution_strategy: str = "WOUND_WAIT",
+        resolved_by: Optional[str] = None,
+        details: Optional[str] = None,
+        timestamp: Optional[float] = None,
+    ) -> int:
+        """Logs a resource contention incident.
+
+        Args:
+            waiting_app_id (str): Application that is waiting for the resource.
+            blocking_app_id (str): Application currently holding the resource.
+            resource_id (str): Resource under contention.
+            resolution_strategy (str): Strategy applied; defaults to 'WOUND_WAIT'.
+            resolved_by (Optional[str]): Resolving party, if any.
+            details (Optional[str]): Free-form detail text.
+            timestamp (Optional[float]): Event timestamp; defaults to now.
+
+        Returns:
+            int: The new conflict_id.
+
+        Raises:
+            sqlite3.IntegrityError: If a foreign key is violated.
+        """
+        sql = """
+            INSERT INTO ConflictLog (
+                waiting_app_id, blocking_app_id, resource_id,
+                resolution_strategy, timestamp, resolved_by, details
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+        ts = timestamp if timestamp is not None else time.time()
+        return self._execute(
+            sql,
+            (
+                str(waiting_app_id),
+                str(blocking_app_id),
+                str(resource_id),
+                str(resolution_strategy),
+                float(ts),
+                str(resolved_by) if resolved_by else None,
+                str(details) if details else None,
+            ),
+        ).lastrowid
+
+    def get_conflicts_by_resource(self, resource_id: str) -> List[Dict[str, Any]]:
+        """Retrieves conflicts involving a resource, newest first."""
+        sql = "SELECT * FROM ConflictLog WHERE resource_id = ? ORDER BY timestamp DESC"
+        return self._execute_many_read(sql, (str(resource_id),))
+
+    def get_conflicts_by_app(self, app_id: str) -> List[Dict[str, Any]]:
+        """Retrieves conflicts where an app is either the waiter or the blocker."""
+        sql = """
+            SELECT * FROM ConflictLog
+            WHERE waiting_app_id = ? OR blocking_app_id = ?
+            ORDER BY timestamp DESC
+        """
+        return self._execute_many_read(sql, (str(app_id), str(app_id)))
+
+    def get_all_conflicts(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Retrieves the most recent conflicts, newest first."""
+        sql = "SELECT * FROM ConflictLog ORDER BY timestamp DESC LIMIT ?"
+        return self._execute_many_read(sql, (int(limit),))
 
     def log_conflict(
         self,
@@ -383,41 +769,15 @@ class ConflictLogRepository(BaseRepository):
         resolution_strategy: str = "WOUND_WAIT",
         resolved_by: Optional[str] = None,
         details: Optional[str] = None,
-        timestamp: Optional[float] = None
+        timestamp: Optional[float] = None,
     ) -> int:
-        """Logs a resource contention or lock conflict incident."""
-        sql = """
-            INSERT INTO ConflictLog (
-                waiting_app_id, blocking_app_id, resource_id,
-                resolution_strategy, timestamp, resolved_by, details
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """
-        ts = timestamp if timestamp is not None else time.time()
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                sql,
-                (
-                    str(waiting_app_id),
-                    str(blocking_app_id),
-                    str(resource_id),
-                    str(resolution_strategy),
-                    float(ts),
-                    str(resolved_by) if resolved_by else None,
-                    str(details) if details else None
-                )
-            )
-            return cursor.lastrowid
-
-    def get_conflicts_by_resource(self, resource_id: str) -> List[Dict[str, Any]]:
-        """Retrieves conflict incidents involving a specific resource."""
-        sql = "SELECT * FROM ConflictLog WHERE resource_id = ? ORDER BY timestamp DESC"
-        with self._get_connection() as conn:
-            rows = conn.execute(sql, (str(resource_id),)).fetchall()
-        return [dict(row) for row in rows]
-
-    def get_all_conflicts(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """Retrieves recent conflict incidents."""
-        sql = "SELECT * FROM ConflictLog ORDER BY timestamp DESC LIMIT ?"
-        with self._get_connection() as conn:
-            rows = conn.execute(sql, (int(limit),)).fetchall()
-        return [dict(row) for row in rows]
+        """Alias for insert_conflict_log."""
+        return self.insert_conflict_log(
+            waiting_app_id,
+            blocking_app_id,
+            resource_id,
+            resolution_strategy,
+            resolved_by,
+            details,
+            timestamp,
+        )

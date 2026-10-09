@@ -82,13 +82,40 @@ CREATE TABLE IF NOT EXISTS ConflictLog (
 );
 
 -- Indexes for performance and relational joins
+
+-- Apps: lookup by lifecycle status and by execution state
+CREATE INDEX IF NOT EXISTS idx_apps_status ON Apps(status);
+CREATE INDEX IF NOT EXISTS idx_apps_state ON Apps(state);
+
+-- Resources: lookup by holder and by lifecycle status
+CREATE INDEX IF NOT EXISTS idx_resources_held_by ON Resources(held_by_app_id);
+CREATE INDEX IF NOT EXISTS idx_resources_status ON Resources(status);
+
+-- ResourceLocks: app_id, resource_id, lock status and acquisition time
 CREATE INDEX IF NOT EXISTS idx_resourcelocks_app ON ResourceLocks(app_id);
 CREATE INDEX IF NOT EXISTS idx_resourcelocks_resource ON ResourceLocks(resource_id);
+CREATE INDEX IF NOT EXISTS idx_resourcelocks_status ON ResourceLocks(status);
+CREATE INDEX IF NOT EXISTS idx_resourcelocks_acquired ON ResourceLocks(acquired_at);
+
+-- MemoryEvents: app_id, event type (action) and timestamp
 CREATE INDEX IF NOT EXISTS idx_memoryevents_app ON MemoryEvents(app_id);
+CREATE INDEX IF NOT EXISTS idx_memoryevents_action ON MemoryEvents(action);
+CREATE INDEX IF NOT EXISTS idx_memoryevents_timestamp ON MemoryEvents(timestamp);
+CREATE INDEX IF NOT EXISTS idx_memoryevents_app_ts ON MemoryEvents(app_id, timestamp DESC);
+
+-- EvictionLog: app_id, event type (algorithm) and timestamp
 CREATE INDEX IF NOT EXISTS idx_evictionlog_app ON EvictionLog(app_id);
+CREATE INDEX IF NOT EXISTS idx_evictionlog_algorithm ON EvictionLog(algorithm);
+CREATE INDEX IF NOT EXISTS idx_evictionlog_timestamp ON EvictionLog(timestamp);
+CREATE INDEX IF NOT EXISTS idx_evictionlog_app_ts ON EvictionLog(app_id, timestamp DESC);
+
+-- ConflictLog: resource_id, both participating apps and event type
 CREATE INDEX IF NOT EXISTS idx_conflictlog_resource ON ConflictLog(resource_id);
 CREATE INDEX IF NOT EXISTS idx_conflictlog_waiting ON ConflictLog(waiting_app_id);
 CREATE INDEX IF NOT EXISTS idx_conflictlog_blocking ON ConflictLog(blocking_app_id);
+CREATE INDEX IF NOT EXISTS idx_conflictlog_strategy ON ConflictLog(resolution_strategy);
+CREATE INDEX IF NOT EXISTS idx_conflictlog_timestamp ON ConflictLog(timestamp);
+CREATE INDEX IF NOT EXISTS idx_conflictlog_resource_ts ON ConflictLog(resource_id, timestamp DESC);
 
 -- Initial Seed Data for Resources (Idempotent: INSERT OR IGNORE)
 INSERT OR IGNORE INTO Resources (resource_id, name, capacity, available_units, status, held_by_app_id, waiting_queue) VALUES
