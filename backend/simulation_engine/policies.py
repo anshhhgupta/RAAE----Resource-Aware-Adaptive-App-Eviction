@@ -19,7 +19,7 @@ from backend.resource_manager.resource_manager import ResourceManager
 from backend.raae_engine.raae_engine import RAAEEngine
 from backend.raae_engine.conflict_manager import ResourceConflictManager
 from backend.raae_engine.models import EvictionDecisionType, RAAEEngineResult
-from backend.raae_engine.persistence import DatabaseEvictionPersistence
+from backend.raae_engine.persistence import ConflictRecord, DatabaseEvictionPersistence
 from database.db import DatabaseManager
 
 
@@ -298,23 +298,16 @@ class RAAEEvictionPolicy(EvictionPolicy):
         pressure_level: str = "ORANGE",
     ) -> EvictionPolicyResult:
         engine = self._get_engine(memory_manager, resource_manager, db_manager)
-        persistence = DatabaseEvictionPersistence(db_manager) if db_manager else None
 
-        # Execute safe eviction workflow through RAAEEngine
-        raae_result = engine.execute_safe_eviction(
-            candidate=candidate,
-            memory_manager=memory_manager,
-            resource_manager=resource_manager,
-            persistence=persistence
-        )
-
-        # Log conflict incident in ConflictLog if conflict was detected and prevented
+        # Build conflict records before persisting so the conflict log is written
+        # inside the same transaction as the eviction itself.
+        conflict_records = []
         if db_manager is not None and decision.conflict_detected:
-            with db_manager.transaction():
-                for res in decision.held_resources:
-                    for waiter_id in decision.waiting_app_ids:
-                        if waiter_id in res.waiting_queue:
-                            db_manager.conflict_log.log_conflict(
+            for res in decision.held_resources:
+                for waiter_id in decision.waiting_app_ids:
+                    if waiter_id in res.waiting_queue:
+                        conflict_records.append(
+                            ConflictRecord(
                                 waiting_app_id=waiter_id,
                                 blocking_app_id=candidate.app_id,
                                 resource_id=res.resource_id,
@@ -325,6 +318,21 @@ class RAAEEvictionPolicy(EvictionPolicy):
                                     f"prevented to avoid freezing waiting app {waiter_id}."
                                 )
                             )
+                        )
+
+        persistence = (
+            DatabaseEvictionPersistence(db_manager, conflict_records=conflict_records)
+            if db_manager
+            else None
+        )
+
+        # Execute safe eviction workflow through RAAEEngine
+        raae_result = engine.execute_safe_eviction(
+            candidate=candidate,
+            memory_manager=memory_manager,
+            resource_manager=resource_manager,
+            persistence=persistence
+        )
 
         return EvictionPolicyResult(
             candidate=candidate,

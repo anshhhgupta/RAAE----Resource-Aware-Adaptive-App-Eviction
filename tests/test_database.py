@@ -144,6 +144,7 @@ class TestDatabaseManager(unittest.TestCase):
 
     def test_log_memory_action_uses_provided_timestamp(self):
         """Test that a supplied memory action timestamp is persisted."""
+        self.db.save_app(App(app_id="app_1", name="Timestamp App"))
         self.db.log_memory_action("app_1", "ALLOCATE", 100, 150, "GREEN", timestamp=123.5)
 
         logs = self.db.get_all_memory_logs()
