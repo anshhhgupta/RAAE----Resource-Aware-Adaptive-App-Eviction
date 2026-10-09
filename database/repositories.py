@@ -1,7 +1,7 @@
 """Repository classes for the RAAE repository / data-access layer.
 
 Every SQL statement in the project lives in this package. Repositories own
-parameterized queries for each of the 6 tables defined in ``schema.sql``:
+parameterized queries for each of the tables defined in ``schema.sql``:
 
 1. Apps
 2. Resources
@@ -9,6 +9,8 @@ parameterized queries for each of the 6 tables defined in ``schema.sql``:
 4. MemoryEvents
 5. EvictionLog
 6. ConflictLog
+7. LockRequests
+8. SystemEvents
 
 Naming follows the canonical data-access API: ``create_*`` inserts a new row,
 ``update_*`` mutates an existing row, ``get_*`` reads, and ``delete_*`` removes.
@@ -429,7 +431,16 @@ class ResourceRepository(BaseRepository):
 
 
 class ResourceLockRepository(BaseRepository):
-    """Repository for ResourceLocks persistence."""
+    """Repository for ResourceLocks persistence.
+
+    ``ResourceLocks`` is the authoritative ledger of lock ownership; the
+    lock-dependent columns of ``Resources`` are re-derived from these rows by
+    the triggers declared in ``schema.sql``. Writing a row here is therefore
+    also how the Resources view of a lock is kept in step.
+
+    This repository records and retires locks. It never decides whether one may
+    be granted: that judgement belongs to the Python resource manager.
+    """
 
     def acquire_resource_lock(
         self,
@@ -452,7 +463,10 @@ class ResourceLockRepository(BaseRepository):
             int: The new lock_id.
 
         Raises:
-            sqlite3.IntegrityError: If app_id or resource_id violates a foreign key.
+            sqlite3.IntegrityError: If app_id or resource_id violates a foreign key,
+                units is not positive, status is not a known lock status, or a
+                second concurrent HELD lock already exists for the same
+                (app_id, resource_id) pair.
         """
         sql = """
             INSERT INTO ResourceLocks (app_id, resource_id, units, status, acquired_at)
@@ -480,6 +494,33 @@ class ResourceLockRepository(BaseRepository):
         """
         ts = released_at if released_at is not None else time.time()
         return self._execute(sql, (float(ts), int(lock_id))).rowcount > 0
+
+    def release_lock_for(
+        self,
+        app_id: str,
+        resource_id: str,
+        released_at: Optional[float] = None,
+    ) -> bool:
+        """Marks the app's single live lock on a resource as released.
+
+        This is the counterpart the semaphore uses on release, where the holder
+        is known but the lock_id is not.
+
+        Args:
+            app_id (str): Application releasing the lock.
+            resource_id (str): Resource the lock was taken on.
+            released_at (Optional[float]): Release timestamp; defaults to now.
+
+        Returns:
+            bool: True if a live lock was transitioned, False if the app held none.
+        """
+        sql = """
+            UPDATE ResourceLocks
+            SET status = 'RELEASED', released_at = ?
+            WHERE app_id = ? AND resource_id = ? AND status = 'HELD'
+        """
+        ts = released_at if released_at is not None else time.time()
+        return self._execute(sql, (float(ts), str(app_id), str(resource_id))).rowcount > 0
 
     def release_all_for_app(self, app_id: str, released_at: Optional[float] = None) -> int:
         """Marks every active lock held by an app as released.
@@ -510,6 +551,26 @@ class ResourceLockRepository(BaseRepository):
             ORDER BY rl.acquired_at ASC
         """
         return self._execute_many_read(sql)
+
+    def get_active_lock(self, app_id: str, resource_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieves the live lock an app holds on a resource, if any.
+
+        Args:
+            app_id (str): Application identifier.
+            resource_id (str): Resource identifier.
+
+        Returns:
+            Optional[Dict[str, Any]]: The HELD lock row, or None.
+        """
+        sql = """
+            SELECT * FROM ResourceLocks
+            WHERE app_id = ? AND resource_id = ? AND status = 'HELD'
+            ORDER BY acquired_at DESC, lock_id DESC
+            LIMIT 1
+        """
+        with self._get_connection() as conn:
+            row = conn.execute(sql, (str(app_id), str(resource_id))).fetchone()
+        return dict(row) if row else None
 
     def get_locks_by_app(self, app_id: str) -> List[Dict[str, Any]]:
         """Retrieves full lock history for an app."""
@@ -689,6 +750,153 @@ class EvictionLogRepository(BaseRepository):
         return self.insert_eviction_log(
             app_id, algorithm, reason, lock_checked, safe_release, result, timestamp
         )
+
+
+class LockRequestRepository(BaseRepository):
+    """Repository for LockRequests persistence.
+
+    LockRequests records lock *attempts* and the outcome the resource manager
+    gave them. It complements ResourceLocks: ownership intervals live in the
+    ledger, while a blocked request that never obtained a lock still leaves a
+    record here.
+    """
+
+    OUTCOMES = ("GRANTED", "QUEUED", "RELEASED")
+
+    def insert_lock_request(
+        self,
+        app_id: str,
+        resource_id: str,
+        outcome: str = "GRANTED",
+        requested_at: Optional[float] = None,
+    ) -> int:
+        """Records one lock request and the outcome it received.
+
+        Args:
+            app_id (str): Application that made the request.
+            resource_id (str): Resource that was requested.
+            outcome (str): One of 'GRANTED', 'QUEUED' or 'RELEASED'.
+            requested_at (Optional[float]): Request timestamp; defaults to now.
+
+        Returns:
+            int: The new request_id.
+
+        Raises:
+            sqlite3.IntegrityError: If a foreign key is violated or outcome is
+                not one of the permitted values.
+        """
+        sql = """
+            INSERT INTO LockRequests (app_id, resource_id, outcome, requested_at)
+            VALUES (?, ?, ?, ?)
+        """
+        ts = requested_at if requested_at is not None else time.time()
+        return self._execute(
+            sql, (str(app_id), str(resource_id), str(outcome).upper(), float(ts))
+        ).lastrowid
+
+    def get_requests_by_app(self, app_id: str) -> List[Dict[str, Any]]:
+        """Retrieves a app's request history, newest first."""
+        sql = "SELECT * FROM LockRequests WHERE app_id = ? ORDER BY requested_at DESC"
+        return self._execute_many_read(sql, (str(app_id),))
+
+    def get_requests_by_resource(self, resource_id: str) -> List[Dict[str, Any]]:
+        """Retrieves a resource's request history, newest first."""
+        sql = "SELECT * FROM LockRequests WHERE resource_id = ? ORDER BY requested_at DESC"
+        return self._execute_many_read(sql, (str(resource_id),))
+
+    def get_requests_by_outcome(self, outcome: str) -> List[Dict[str, Any]]:
+        """Retrieves every request that received a given outcome, newest first."""
+        sql = "SELECT * FROM LockRequests WHERE outcome = ? ORDER BY requested_at DESC"
+        return self._execute_many_read(sql, (str(outcome).upper(),))
+
+    def get_all_requests(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Retrieves the most recent requests, newest first."""
+        sql = "SELECT * FROM LockRequests ORDER BY requested_at DESC LIMIT ?"
+        return self._execute_many_read(sql, (int(limit),))
+
+    def log_lock_request(
+        self,
+        app_id: str,
+        resource_id: str,
+        outcome: str = "GRANTED",
+        requested_at: Optional[float] = None,
+    ) -> int:
+        """Alias for insert_lock_request."""
+        return self.insert_lock_request(app_id, resource_id, outcome, requested_at)
+
+
+class SystemEventRepository(BaseRepository):
+    """Repository for SystemEvents persistence.
+
+    Holds machine-scoped samples such as memory pressure readings, which belong
+    to the whole system rather than to any single application.
+    """
+
+    def insert_system_event(
+        self,
+        pressure_level: str,
+        used_memory: int,
+        total_memory: int,
+        event_type: str = "MEMORY_PRESSURE",
+        timestamp: Optional[float] = None,
+    ) -> int:
+        """Records a system-wide event sample.
+
+        Args:
+            pressure_level (str): One of 'GREEN', 'YELLOW', 'ORANGE' or 'RED'.
+            used_memory (int): Memory in use at sample time.
+            total_memory (int): Total system memory.
+            event_type (str): Event category; defaults to 'MEMORY_PRESSURE'.
+            timestamp (Optional[float]): Sample timestamp; defaults to now.
+
+        Returns:
+            int: The new event_id.
+
+        Raises:
+            sqlite3.IntegrityError: If pressure_level is not a known level.
+        """
+        sql = """
+            INSERT INTO SystemEvents (event_type, pressure_level, used_memory, total_memory, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+        """
+        ts = timestamp if timestamp is not None else time.time()
+        return self._execute(
+            sql,
+            (
+                str(event_type),
+                str(pressure_level).upper(),
+                int(used_memory),
+                int(total_memory),
+                float(ts),
+            ),
+        ).lastrowid
+
+    def log_memory_pressure(
+        self,
+        pressure_level: str,
+        used_memory: int,
+        total_memory: int,
+        event_type: str = "MEMORY_PRESSURE",
+        timestamp: Optional[float] = None,
+    ) -> int:
+        """Alias for insert_system_event used by the memory manager."""
+        return self.insert_system_event(
+            pressure_level, used_memory, total_memory, event_type, timestamp
+        )
+
+    def get_events_by_type(self, event_type: str) -> List[Dict[str, Any]]:
+        """Retrieves samples of one event type, newest first."""
+        sql = "SELECT * FROM SystemEvents WHERE event_type = ? ORDER BY timestamp DESC"
+        return self._execute_many_read(sql, (str(event_type),))
+
+    def get_pressure_samples(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Retrieves the most recent memory pressure samples, newest first."""
+        sql = """
+            SELECT * FROM SystemEvents
+            WHERE event_type = 'MEMORY_PRESSURE'
+            ORDER BY timestamp DESC LIMIT ?
+        """
+        return self._execute_many_read(sql, (int(limit),))
 
 
 class ConflictLogRepository(BaseRepository):

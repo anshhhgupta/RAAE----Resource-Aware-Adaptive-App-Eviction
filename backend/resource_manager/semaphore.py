@@ -1,13 +1,19 @@
 """Semaphore-style resource locking implementation."""
 
-from typing import Optional, Dict, Union
+from typing import Any, Optional, Dict, Union
 from backend.models.app import App, AppState
 from backend.models.resource import Resource, ResourceStatus
 
 
 class SemaphoreLock:
     """Implements binary semaphore locking and unlocking for a shared Resource.
-    
+
+    Every granted acquisition and every release performed here is reported to the
+    database through the ``log_lock_request`` hook, which records both the
+    request event and the resulting ResourceLocks ledger row. The decision to
+    grant, queue or reject a request is made above this class; persistence only
+    records the outcome.
+
     Attributes:
         resource (Resource): The target resource to control.
         db (Optional[Any]): Optional DatabaseManager repository instance for clean persistence hooks.
