@@ -3,6 +3,7 @@
 from typing import Dict, List, Optional, Any, Union, Tuple
 from backend.models.app import App
 from backend.models.resource import Resource, ResourceStatus
+from backend.persistence_bridge import PersistenceBridge
 from backend.resource_manager.semaphore import SemaphoreLock
 
 
@@ -19,13 +20,13 @@ class ResourceManager:
         self.resources: Dict[str, Resource] = {}
         self.locks: Dict[str, SemaphoreLock] = {}
         self.apps: Dict[str, App] = {}
-        self.db: Optional[Any] = db
+        self.db: Optional[Any] = PersistenceBridge.wrap(db)
 
     def set_db_manager(self, db: Any) -> None:
         """Sets the DatabaseManager repository instance."""
-        self.db = db
+        self.db = PersistenceBridge.wrap(db)
         for lock in self.locks.values():
-            lock.set_db_manager(db)
+            lock.set_db_manager(self.db)
 
     def register_app(self, app: App) -> None:
         """Registers an App object with ResourceManager."""

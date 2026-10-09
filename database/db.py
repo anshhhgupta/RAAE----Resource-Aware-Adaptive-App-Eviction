@@ -19,9 +19,11 @@ from database.repositories import (
     AppRepository,
     ConflictLogRepository,
     EvictionLogRepository,
+    LockRequestRepository,
     MemoryEventRepository,
     ResourceLockRepository,
     ResourceRepository,
+    SystemEventRepository,
 )
 from database.transaction import TransactionManager, ensure_no_open_transaction
 
@@ -40,6 +42,8 @@ class DatabaseManager:
         "MemoryEvents",
         "EvictionLog",
         "ConflictLog",
+        "LockRequests",
+        "SystemEvents",
     ]
 
     def __init__(self, db_path: str = "database/raae.db") -> None:
@@ -60,6 +64,8 @@ class DatabaseManager:
         self.memory_events = MemoryEventRepository(self)
         self.eviction_log = EvictionLogRepository(self)
         self.conflict_log = ConflictLogRepository(self)
+        self.lock_requests = LockRequestRepository(self)
+        self.system_events = SystemEventRepository(self)
         self.events = EventRepository(self)
 
         self.init_db()
@@ -181,13 +187,34 @@ class DatabaseManager:
     # Resource locks
     # ---------------------------------------------------------
 
-    def acquire_resource_lock(self, app_id: str, resource_id: str, units: int = 1) -> int:
+    def acquire_resource_lock(
+        self,
+        app_id: str,
+        resource_id: str,
+        units: int = 1,
+        acquired_at: Optional[float] = None,
+    ) -> int:
         """Records a resource lock acquisition and returns the new lock_id."""
-        return self.resource_locks.acquire_resource_lock(app_id, resource_id, units)
+        return self.resource_locks.acquire_resource_lock(
+            app_id, resource_id, units, acquired_at=acquired_at
+        )
 
-    def release_resource_lock(self, lock_id: int) -> bool:
+    def release_resource_lock(self, lock_id: int, released_at: Optional[float] = None) -> bool:
         """Marks a resource lock as released."""
-        return self.resource_locks.release_resource_lock(lock_id)
+        return self.resource_locks.release_resource_lock(lock_id, released_at)
+
+    def release_lock_for(
+        self,
+        app_id: str,
+        resource_id: str,
+        released_at: Optional[float] = None,
+    ) -> bool:
+        """Marks an app's live lock on a resource as released."""
+        return self.resource_locks.release_lock_for(app_id, resource_id, released_at)
+
+    def get_active_lock(self, app_id: str, resource_id: str) -> Optional[Dict[str, Any]]:
+        """Returns the live lock an app holds on a resource, if any."""
+        return self.resource_locks.get_active_lock(app_id, resource_id)
 
     # ---------------------------------------------------------
     # Logs
@@ -243,6 +270,31 @@ class DatabaseManager:
             timestamp,
         )
 
+    def insert_lock_request(
+        self,
+        app_id: str,
+        resource_id: str,
+        outcome: str = "GRANTED",
+        requested_at: Optional[float] = None,
+    ) -> int:
+        """Records a lock request and returns the new request_id."""
+        return self.lock_requests.insert_lock_request(
+            app_id, resource_id, outcome, requested_at
+        )
+
+    def insert_system_event(
+        self,
+        pressure_level: str,
+        used_memory: int,
+        total_memory: int,
+        event_type: str = "MEMORY_PRESSURE",
+        timestamp: Optional[float] = None,
+    ) -> int:
+        """Records a system-wide sample and returns the new event_id."""
+        return self.system_events.insert_system_event(
+            pressure_level, used_memory, total_memory, event_type, timestamp
+        )
+
     def get_recent_events(self, limit: int = 50, **filters: Any) -> List[Dict[str, Any]]:
         """Retrieves a merged, newest-first timeline across the log tables."""
         return self.events.get_recent_events(limit=limit, **filters)
@@ -265,9 +317,50 @@ class DatabaseManager:
             app_id, action, before, after, pressure, timestamp
         )
 
+    def log_lock_request(
+        self,
+        app_id: str,
+        resource_id: str,
+        outcome: str = "GRANTED",
+        requested_at: Optional[float] = None,
+    ) -> int:
+        """Logs a lock request outcome.
+
+        Named to match the hook ``SemaphoreLock`` already calls, which previously
+        matched no repository and therefore never persisted anything.
+        """
+        return self.lock_requests.insert_lock_request(
+            app_id, resource_id, outcome, requested_at
+        )
+
+    def log_memory_pressure(
+        self,
+        pressure_level: str,
+        used_memory: int,
+        total_memory: int,
+        timestamp: Optional[float] = None,
+    ) -> int:
+        """Logs a system-wide memory pressure sample.
+
+        Named to match the hook ``MemoryManager.get_pressure_level`` already
+        calls, which previously matched no repository and therefore never
+        persisted anything.
+        """
+        return self.system_events.insert_system_event(
+            pressure_level, used_memory, total_memory, "MEMORY_PRESSURE", timestamp
+        )
+
     def get_all_memory_logs(self, limit: int = 100) -> List[Dict[str, Any]]:
         """Retrieves recent MemoryEvents rows."""
         return self.memory_events.get_all_events(limit)
+
+    def get_all_lock_requests(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Retrieves recent LockRequests rows."""
+        return self.lock_requests.get_all_requests(limit)
+
+    def get_all_pressure_samples(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Retrieves recent SystemEvents memory pressure samples."""
+        return self.system_events.get_pressure_samples(limit)
 
     def close(self) -> None:
         """Closes the managed database connection."""

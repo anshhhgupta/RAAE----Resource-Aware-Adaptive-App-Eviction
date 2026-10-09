@@ -4,6 +4,7 @@ from enum import Enum
 import time
 from typing import Dict, List, Optional, Tuple, Any
 from backend.models.app import App, AppState, AppStatus
+from backend.persistence_bridge import PersistenceBridge
 
 
 class MemoryPressureLevel(str, Enum):
@@ -28,7 +29,7 @@ class MemoryManager:
         self.total_memory: int = max(1, int(total_memory))
         self.apps: Dict[str, App] = {}
         self.clock_hand: int = 0
-        self.db: Optional[Any] = db
+        self.db: Optional[Any] = PersistenceBridge.wrap(db)
 
     def set_total_memory(self, total_memory: int) -> None:
         """Dynamically configures the total system RAM limit in MB."""
@@ -36,7 +37,7 @@ class MemoryManager:
 
     def set_db_manager(self, db: Any) -> None:
         """Sets the DatabaseManager repository layer instance."""
-        self.db = db
+        self.db = PersistenceBridge.wrap(db)
 
     def add_app(self, app: App) -> None:
         """Adds/registers a simulated application with the Memory Manager."""

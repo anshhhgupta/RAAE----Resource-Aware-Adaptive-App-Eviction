@@ -103,6 +103,7 @@ Resource locking is implemented using **Binary Semaphores** (Mutexes) via the `S
 4. **Automatic Unblocking**: When a holder releases a resource:
    - The lock is released and automatically granted to the next app in the FIFO `waiting_queue`.
    - The unblocked app receives the lock, its state transitions back to active (`AppState.BACKGROUND`), and its `touch()` method is called.
+5. **Ledger Synchronization**: When a `DatabaseManager` is attached, every granted acquisition appends a `HELD` row to `ResourceLocks`, every release retires that row, and queue hand-off moves it to the next app. The rules above are decided here in Python; the ledger only records the outcome.
 
 ---
 
@@ -121,3 +122,133 @@ The `WorkloadGenerator` generates reproducible synthetic workload events for sim
 
 ### Primary Interface
 `generate_workload(seed, ticks, scenario, num_apps, ram_mb)` returns a `WorkloadTrace` containing setup apps and a sequence of tick events for execution.
+
+---
+
+## 7. Database Layer (`database/`)
+
+The `database` package is the only place SQL is written. `DatabaseManager` (`db.py`) owns the connection, `PRAGMA foreign_keys = ON`, schema application, and transaction boundaries; `repositories.py` holds every statement; `schema.sql` defines the tables.
+
+### Entity Relationships
+
+```text
+                 (1)                (*)                 (1)
+   Apps ──────────────────── ResourceLocks ──────────────────── Resources
+     │                                                     ▲          │
+     │ (1)                                                  │ (1)      │ (1)
+     │                                                     └──────────┘
+     │ (*)
+     ├── MemoryEvents        (every allocation / deallocation / pressure sample)
+     ├── EvictionLog         (every eviction decision and its outcome)
+     ├── ConflictLog         (two references per row: waiting_app_id, blocking_app_id)
+     │                       (plus a third reference to Resources.resource_id)
+     └── LockRequests        (every lock attempt, including blocked ones)
+
+   Resources.held_by_app_id  ──► Apps.app_id   (ON DELETE SET NULL)
+   ResourceLocks.app_id      ──► Apps.app_id         (ON DELETE CASCADE)
+   ResourceLocks.resource_id ──► Resources.resource_id (ON DELETE CASCADE)
+   LockRequests.app_id       ──► Apps.app_id         (ON DELETE CASCADE)
+   LockRequests.resource_id  ──► Resources.resource_id (ON DELETE CASCADE)
+
+   SystemEvents has no foreign key: memory pressure is a property of the whole
+   machine, so a sample is not stored against any single app.
+```
+
+The schema is in third normal form: every fact lives in exactly one table. `ConflictLog` deliberately references `Apps` twice rather than storing app attributes inline, and `LockRequests` is separate from `ResourceLocks` because ownership intervals and request attempts are different facts — a blocked request leaves a `LockRequests` row but never owns a lock.
+
+### Persisted Events
+
+| Event                   | Stored in                                  |
+| ----------------------- | ------------------------------------------ |
+| App creation            | `Apps`                                     |
+| Memory allocation       | `MemoryEvents` (`action = ALLOCATE`)       |
+| Memory deallocation     | `MemoryEvents` (`action = DEALLOCATE`)     |
+| Memory pressure         | `SystemEvents`                             |
+| Resource acquisition    | `ResourceLocks` + `LockRequests` (`GRANTED`)  |
+| Resource request blocked| `LockRequests` (`QUEUED`)                  |
+| Resource release        | `ResourceLocks` (`RELEASED`) + `LockRequests` (`RELEASED`) |
+| Eviction attempt        | `EvictionLog` (`result = EVICTED` / `CONFLICT` / `WAIT`) |
+| Successful eviction     | `EvictionLog` (`result = EVICTED`) + `MemoryEvents` (`EVICT`) |
+| Blocked / waiting eviction | `EvictionLog` (`result = CONFLICT` or `WAIT`) + `MemoryEvents` (`EVICT_ATTEMPT`) |
+| Wound-Wait conflict     | `ConflictLog` (`resolution_strategy = WOUND_WAIT`) |
+| Freeze incident         | `ConflictLog` (`resolution_strategy = NONE`, details prefixed `FREEZE`) |
+
+### Lock Consistency
+
+`ResourceLocks` is the **authoritative ledger** of who holds what. `HELD` rows describe current ownership; `RELEASED` rows are retained history.
+
+Three `Resources` columns duplicate that ledger for fast single-row reads, so triggers re-derive them on every ledger change:
+
+| Column            | Derivation                                                    |
+| ----------------- | ------------------------------------------------------------- |
+| `available_units` | `max(capacity - SUM(units) over HELD locks, 0)`               |
+| `held_by_app_id`  | `app_id` of the earliest `HELD` lock, `NULL` when none        |
+| `status`          | `WAITING` if `waiting_queue` is non-empty, else `LOCKED`/`FREE` |
+
+- `trg_resourcelocks_refresh_after_insert`
+- `trg_resourcelocks_refresh_after_update`
+- `trg_resourcelocks_refresh_after_delete`
+
+Integrity rules enforced by the database:
+
+| Rule                                                      | Mechanism                                                     |
+| --------------------------------------------------------- | ------------------------------------------------------------- |
+| Locks reference existing apps and resources               | `FOREIGN KEY` constraints                                      |
+| A lock covers at least one unit                            | `CHECK (units > 0)`                                           |
+| `status` is one of `HELD` / `RELEASED`                     | `CHECK`                                                        |
+| A `RELEASED` row carries a `released_at`                   | `CHECK`                                                        |
+| One live lock per `(app_id, resource_id)`                  | Partial unique index `ux_resourcelocks_held_app_resource`      |
+| Removing an app or resource clears its dependent rows      | `ON DELETE CASCADE`                                            |
+
+### Responsibility Split
+
+- **Python decides.** `SemaphoreLock`, `ResourceManager` and the RAAE engine determine whether a lock may be granted, queued, or refused. No SQL expression encodes that policy.
+- **SQLite persists and enforces consistency.** The triggers only reflect a decision that has already been made; they never adjudicate contention, and they clamp `available_units` at zero instead of rejecting a recorded acquisition.
+
+---
+
+## 8. Persistence Integration (`backend/persistence_bridge.py`)
+
+`PersistenceBridge` connects the simulation modules to the repositories. It exists because two hooks the managers already called matched no repository, and because a database failure must never be allowed to corrupt in-memory state.
+
+### Interface Mismatches It Resolves
+
+| Hook already called by              | Problem                                         | Resolution                                     |
+| ----------------------------------- | ----------------------------------------------- | ---------------------------------------------- |
+| `SemaphoreLock` → `db.log_lock_request(...)`  | No matching repository, so nothing was written | Writes `LockRequests` plus the `ResourceLocks` ledger row |
+| `MemoryManager.get_pressure_level` → `db.log_memory_pressure(...)` | No matching repository | Writes `SystemEvents`, the correct home for a machine-scoped sample |
+
+`WoundWaitConflictAdapter` (`backend/raae_engine/conflict_manager.py`) covers a second mismatch: the Wound-Wait `ConflictManager` exposes `resolve_conflict(...)`, while the RAAE Engine asks for `get_held_resources(...)` and `evaluate_eviction_conflict(...)`. The adapter supplies the RAAE interface and delegates every contested decision to Wound-Wait, so neither module had to change.
+
+### Failure Containment
+
+The managers mutate their objects **before** persisting, so an exception escaping a write would abort the simulation halfway through a change it has already made. The bridge therefore routes every write through a guard that records the failure in `bridge.failures` and returns `None`/`False`:
+
+- Writes made directly on the bridge — `save_app`, `save_resource`, `log_memory_action`, `log_lock_request`, `log_eviction`, `log_conflict`, `log_freeze`, `log_memory_pressure`.
+- Writes made through a forwarded repository — `bridge.resource_locks.release_all_for_app(...)` returns a `SafeRepository` proxy that guards each call.
+- Transactional groups — `bridge.transaction()` returns a `TolerantTransaction`, which swallows a failure to open or commit.
+
+An exception raised by the *caller's own body* is still propagated: that is a simulation bug, not a persistence problem, and hiding it would be worse than losing a row.
+
+### Wiring
+
+`PersistenceBridge.wrap(db)` is idempotent and returns a plain `DatabaseManager` untouched, so the managers may be constructed with or without a bridge:
+
+```python
+db = DatabaseManager(":memory:")
+bridge = PersistenceBridge(db)
+
+memory = MemoryManager(total_memory=1000, db=bridge)
+resources = ResourceManager(db=bridge)      # ResourceManager and SemaphoreLock wrap db themselves
+resources.create_default_resources()
+
+conflict_manager = WoundWaitConflictAdapter(
+    WoundWaitConflictManager(db=bridge), resources
+)
+engine = RAAEEngine(
+    conflict_manager,
+    memory_manager=memory,
+    resource_manager=resources,
+    persistence=DatabaseEvictionPersistence(bridge),
+)
+```
