@@ -27,8 +27,10 @@ class RAAEEngine:
     def evaluate_eviction_candidate(self, candidate: App) -> RAAEEngineResult:
         """Evaluates whether a clock-selected candidate is safe to evict."""
         held_resources = self.check_held_resources(candidate)
+        waiting_resources = self.check_waiting_resources(candidate)
+        conflict_resources = self._unique_resources((*held_resources, *waiting_resources))
 
-        if not held_resources:
+        if not conflict_resources:
             return self.build_eviction_decision(
                 candidate=candidate,
                 held_resources=held_resources,
@@ -37,29 +39,43 @@ class RAAEEngine:
                 )
             )
 
-        conflict_decision = self.request_conflict_decision(candidate, held_resources)
+        conflict_decision = self.request_conflict_decision(candidate, conflict_resources)
         return self.build_eviction_decision(candidate, held_resources, conflict_decision)
 
     def check_held_resources(self, candidate: App) -> Sequence[Resource]:
         """Asks the Conflict Manager boundary for resources held by candidate."""
         return tuple(self.conflict_manager.get_held_resources(candidate))
 
+    def check_waiting_resources(self, candidate: App) -> Sequence[Resource]:
+        """Finds resources for which the candidate is queued, when supported."""
+        get_waiting_resources = getattr(self.conflict_manager, "get_waiting_resources", None)
+        if get_waiting_resources is None:
+            return ()
+        return tuple(get_waiting_resources(candidate))
+
+    @staticmethod
+    def _unique_resources(resources: Sequence[Resource]) -> Sequence[Resource]:
+        unique = {}
+        for resource in resources:
+            unique[resource.resource_id] = resource
+        return tuple(unique.values())
+
     def request_conflict_decision(
         self,
         candidate: App,
-        held_resources: Sequence[Resource]
+        conflict_resources: Sequence[Resource]
     ) -> ConflictDecision:
-        """Requests conflict status for a resource-holding candidate."""
-        if not held_resources:
+        """Requests conflict status for a candidate's held or requested resources."""
+        if not conflict_resources:
             return ConflictDecision.no_conflict(
-                reason="Candidate holds no resources."
+                reason="Candidate has no held or requested resources."
             )
 
-        decision = self.conflict_manager.evaluate_eviction_conflict(candidate, held_resources)
+        decision = self.conflict_manager.evaluate_eviction_conflict(candidate, conflict_resources)
         if decision is None:
             return ConflictDecision.not_safe(
                 reason="Conflict Manager did not return a decision.",
-                resource_ids=[resource.resource_id for resource in held_resources]
+                resource_ids=[resource.resource_id for resource in conflict_resources]
             )
 
         return decision
