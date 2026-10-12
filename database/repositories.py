@@ -371,6 +371,12 @@ class EvictionLogRepository(BaseRepository):
             rows = conn.execute(sql, (int(limit),)).fetchall()
         return [dict(row) for row in rows]
 
+    def count_evictions(self) -> int:
+        """Returns the total number of recorded eviction decisions."""
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT COUNT(*) AS total FROM EvictionLog").fetchone()
+        return int(row["total"])
+
 
 class ConflictLogRepository(BaseRepository):
     """Repository for managing ConflictLog records in SQLite."""
@@ -421,3 +427,9 @@ class ConflictLogRepository(BaseRepository):
         with self._get_connection() as conn:
             rows = conn.execute(sql, (int(limit),)).fetchall()
         return [dict(row) for row in rows]
+
+    def count_conflicts(self) -> int:
+        """Returns the total number of recorded resource conflicts."""
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT COUNT(*) AS total FROM ConflictLog").fetchone()
+        return int(row["total"])

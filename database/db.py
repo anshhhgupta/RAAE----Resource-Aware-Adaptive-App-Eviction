@@ -40,7 +40,7 @@ class DatabaseManager:
         self._shared_conn: Optional[sqlite3.Connection] = None
 
         if db_path == ":memory:":
-            self._shared_conn = sqlite3.connect(":memory:")
+            self._shared_conn = sqlite3.connect(":memory:", check_same_thread=False)
             self._shared_conn.row_factory = sqlite3.Row
             self._shared_conn.execute("PRAGMA foreign_keys = ON;")
         else:

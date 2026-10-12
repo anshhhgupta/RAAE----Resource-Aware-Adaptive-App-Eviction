@@ -17,6 +17,7 @@ Layout
 
 import sys
 import os
+from datetime import datetime
 
 # Make sure the project root is on sys.path so backend/ and database/ imports work
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -57,21 +58,6 @@ PRESSURE_COLOUR = {
     "YELLOW": "🟡",
     "ORANGE": "🟠",
     "RED":    "🔴",
-}
-
-STATE_BADGE = {
-    "FOREGROUND": "🌟 FOREGROUND",
-    "BACKGROUND": "🔅 BACKGROUND",
-    "WAITING":    "⏳ WAITING",
-    "EVICTED":    "💀 EVICTED",
-}
-
-EVENT_ICON = {
-    "eviction": "✅",
-    "conflict": "⚠️",
-    "resource": "🔒",
-    "info":     "ℹ️",
-    "error":    "❌",
 }
 
 # ============================================================================
@@ -120,6 +106,12 @@ with ctrl_col5:
 # Running status badge
 status_text = "🟢 **Running**" if ctrl.is_running else "🔴 **Stopped**"
 st.markdown(f"Simulation status: {status_text}")
+refresh_col, updated_col = st.columns([1, 5])
+with refresh_col:
+    if st.button("↻ Refresh view", use_container_width=True):
+        st.rerun()
+with updated_col:
+    st.caption(f"View refreshed: {datetime.now().strftime('%H:%M:%S')}")
 
 st.divider()
 
@@ -191,132 +183,122 @@ with st.sidebar:
         st.info("Add apps first, then manage resources here.")
 
 # ============================================================================
-# MAIN CONTENT — three-column layout
+# MAIN CONTENT
 # ============================================================================
 
-left_col, mid_col, right_col = st.columns([1.4, 1.6, 1.6])
-
 # ============================================================================
-# ④ RAM USAGE
+# ④ SYSTEM METRICS
 # ============================================================================
 
-with left_col:
-    st.subheader("💾 RAM Usage")
-    ram = ctrl.get_ram_snapshot()
-    pressure_icon = PRESSURE_COLOUR.get(ram["pressure"], "⚪")
+metrics = ctrl.get_system_metrics()
+pressure_icon = PRESSURE_COLOUR.get(metrics["pressure"], "⚪")
 
-    st.metric("Used", f"{ram['used_mb']} MB")
-    st.metric("Free", f"{ram['free_mb']} MB")
-    st.metric("Total", f"{ram['total_mb']} MB")
+metric_rows = [
+    [
+        ("Total RAM", f"{metrics['total_mb']} MB"),
+        ("Used RAM", f"{metrics['used_mb']} MB"),
+        ("Available RAM", f"{metrics['free_mb']} MB"),
+        ("Memory pressure", f"{pressure_icon} {metrics['pressure']}"),
+    ],
+    [
+        ("Total apps", metrics["total_apps"]),
+        ("Active apps", metrics["active_apps"]),
+        ("Eviction count", metrics["eviction_count"]),
+        ("Conflict count", metrics["conflict_count"]),
+    ],
+]
+for metric_row in metric_rows:
+    columns = st.columns(4)
+    for column, (label, value) in zip(columns, metric_row):
+        column.metric(label, "Unavailable" if value is None else value)
 
-    pct = ram["usage_pct"]
-    st.progress(
-        min(pct / 100.0, 1.0),
-        text=f"{pct:.1f}% used"
+usage_pct = metrics["usage_pct"]
+st.progress(min(usage_pct / 100.0, 1.0), text=f"{usage_pct:.1f}% RAM used")
+st.caption(f"Clock hand: {metrics['clock_hand']}")
+st.divider()
+
+# ============================================================================
+# ⑤ APPLICATIONS
+# ============================================================================
+
+st.subheader("📱 Applications")
+apps = ctrl.get_active_apps()
+app_names = {app.app_id: app.name for app in apps}
+if not apps:
+    st.info("No apps registered yet. Add one in the sidebar.")
+else:
+    app_rows = []
+    for app in apps:
+        app_rows.append({
+            "App ID": app.app_id,
+            "Name": app.name,
+            "Priority": app.priority,
+            "State": app.state.value if app.state else "Unavailable",
+            "Memory usage (MB)": app.memory_footprint,
+            "Reference bit": app.reference_bit,
+            "Held resources": ", ".join(sorted(app.held_resources)) or "—",
+        })
+    st.dataframe(
+        app_rows,
+        use_container_width=True,
+        hide_index=True,
+        height=min(55 + len(app_rows) * 38, 400),
     )
 
-    st.markdown(f"**Pressure:** {pressure_icon} {ram['pressure']}")
-    st.markdown(f"**Clock Hand:** `{ram['clock_hand']}`")
-
 # ============================================================================
-# ⑤ ACTIVE APPLICATIONS
+# ⑥ RESOURCE STATE
 # ============================================================================
 
-with mid_col:
-    st.subheader("📱 Applications")
-    apps = ctrl.get_active_apps()
-    if not apps:
-        st.info("No apps registered yet. Add one in the sidebar.")
-    else:
-        rows = []
-        for a in apps:
-            held = ", ".join(sorted(a.held_resources)) or "—"
-            rows.append({
-                "ID": a.app_id,
-                "Name": a.name,
-                "Priority": a.priority,
-                "State": STATE_BADGE.get(a.state.value, a.state.value),
-                "RAM (MB)": a.memory_footprint,
-                "Ref Bit": a.reference_bit,
-                "Holds": held,
-            })
-        st.dataframe(
-            rows,
-            use_container_width=True,
-            height=min(55 + len(rows) * 38, 400),
-        )
-
-# ============================================================================
-# ⑥ RESOURCE LOCKS
-# ============================================================================
-
-with right_col:
-    st.subheader("🔒 Resource Locks")
-    locks = ctrl.get_resource_locks()
-    if not locks:
-        st.info("No resources registered.")
-    else:
-        for lock in locks:
-            status_icon = "🟢" if lock["status"] == "FREE" else ("🔴" if lock["status"] == "LOCKED" else "🟡")
-            holders_str = ", ".join(lock["holders"]) if lock["holders"] else "—"
-            with st.container():
-                c1, c2, c3 = st.columns([2, 1, 2])
-                c1.markdown(f"**{lock['resource_id']}**")
-                c2.markdown(f"{status_icon} {lock['status']}")
-                c3.markdown(f"Held by: `{holders_str}`")
-                st.caption(
-                    f"Capacity: {lock['capacity']} | Available: {lock['available']}"
-                )
-        st.markdown("")  # spacer
+st.subheader("🔒 Resources")
+locks = ctrl.get_resource_locks()
+queues_by_resource = {
+    queue["resource_id"]: queue["waiting"]
+    for queue in ctrl.get_waiting_queues()
+}
+if not locks:
+    st.info("No resources registered.")
+else:
+    resource_rows = []
+    for lock in locks:
+        holders = [
+            f"{app_names.get(app_id, app_id)} ({app_id})"
+            for app_id in lock["holders"]
+        ]
+        waiters = [
+            f"{app_names.get(app_id, app_id)} ({app_id})"
+            for app_id in queues_by_resource.get(lock["resource_id"], [])
+        ]
+        resource_rows.append({
+            "Resource name": lock["name"],
+            "Status": lock["status"],
+            "Current holder": ", ".join(holders) or "—",
+            "Waiting queue": ", ".join(waiters) or "—",
+            "Capacity": lock["capacity"],
+            "Available": lock["available"],
+        })
+    st.dataframe(resource_rows, use_container_width=True, hide_index=True)
 
 st.divider()
 
 # ============================================================================
-# ⑦ WAITING QUEUES
+# ⑦ EVENT LOG
 # ============================================================================
 
-bottom_left, bottom_right = st.columns(2)
-
-with bottom_left:
-    st.subheader("⏳ Waiting Queues")
-    queues = ctrl.get_waiting_queues()
-    if not queues:
-        st.success("No apps currently waiting for any resource.")
-    else:
-        for q in queues:
-            # Resolve app names where possible
-            def _name(aid):
-                a = ctrl.mem_mgr.apps.get(aid)
-                return f"{a.name} ({aid})" if a else aid
-
-            waiter_labels = [_name(w) for w in q["waiting"]]
-            st.markdown(f"**{q['resource_id']}** — {q['queue_depth']} waiting:")
-            for label in waiter_labels:
-                st.markdown(f"  - {label}")
-
-# ============================================================================
-# ⑧ LATEST EVICTION / CONFLICT EVENTS
-# ============================================================================
-
-with bottom_right:
-    st.subheader("📋 Latest Events")
-    events = ctrl.get_recent_events(n=15)
-    if not events:
-        st.info("No events yet. Start the simulation and run a Clock Tick.")
-    else:
-        for ev in events:
-            icon = EVENT_ICON.get(ev.kind, "•")
-            ts = __import__("datetime").datetime.fromtimestamp(ev.timestamp).strftime("%H:%M:%S")
-            colour = {
-                "eviction": "green",
-                "conflict": "orange",
-                "error":    "red",
-                "resource": "blue",
-                "info":     "gray",
-            }.get(ev.kind, "gray")
-            st.markdown(
-                f":{colour}[{icon} `{ts}` {ev.message}]"
-            )
+st.subheader("📋 Event log")
+event_rows = ctrl.get_event_log(n=50)
+if not event_rows:
+    st.info("No events recorded yet.")
+else:
+    for row in event_rows:
+        row["Timestamp"] = datetime.fromtimestamp(row.pop("timestamp")).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        row["Event type"] = row.pop("event_type")
+        row["App"] = row.pop("app") or "—"
+        row["Resource"] = row.pop("resource") or "—"
+        row["Decision"] = row.pop("decision") or "—"
+        row["Details"] = row.pop("message")
+    st.dataframe(event_rows, use_container_width=True, hide_index=True)
 
 st.divider()
 
@@ -339,7 +321,6 @@ with st.expander("🗄️ DB: Eviction Log (last 10)"):
 # Auto-refresh hint
 # ---------------------------------------------------------------------------
 st.caption(
-    "💡 Tip: Use the **Clock Tick** button to advance the simulation one step, "
-    "or **Random Event** to inject a workload event. "
-    "Install `streamlit-autorefresh` for timed auto-ticking."
+    "💡 Use **Refresh view** to reload the displayed state without advancing the simulation. "
+    "Use **Clock Tick** to advance one step or **Random Event** to inject a workload event."
 )

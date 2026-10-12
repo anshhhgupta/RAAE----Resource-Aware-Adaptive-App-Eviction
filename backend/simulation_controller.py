@@ -13,6 +13,8 @@ lives inside the UI layer itself.
 
 import time
 import uuid
+import logging
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,6 +27,8 @@ from backend.raae_engine.models import RAAEEngineResult, EvictionDecisionType
 from backend.resource_manager.resource_manager import ResourceManager
 from backend.workload_generator.workload_generator import WorkloadGenerator
 from database.db import DatabaseManager
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +157,7 @@ class SimulationController:
         self._log(SimEvent(
             "info",
             f"➕ App '{app.name}' (ID={app_id}) added — prio={priority}, mem={memory_footprint}MB.",
+            details={"app_id": app_id, "decision": "APP_ADDED"},
         ))
         return app
 
@@ -165,6 +170,7 @@ class SimulationController:
             "info",
             f"🔴 Memory pressure triggered → +{allocated}MB allocated. "
             f"Usage: {pct:.1f}% ({level})",
+            details={"decision": f"ALLOCATED_{allocated}_MB", "pressure": level},
         ))
         return allocated
 
@@ -173,10 +179,18 @@ class SimulationController:
         app = self.mem_mgr.apps.get(app_id)
         resource = self.res_mgr.get_resource(resource_id)
         if app is None:
-            self._log(SimEvent("error", f"Request resource: app '{app_id}' not found."))
+            self._log(SimEvent(
+                "error",
+                f"Request resource: app '{app_id}' not found.",
+                details={"app_id": app_id, "resource_id": resource_id, "decision": "APP_NOT_FOUND"},
+            ))
             return False
         if resource is None:
-            self._log(SimEvent("error", f"Request resource: resource '{resource_id}' not registered."))
+            self._log(SimEvent(
+                "error",
+                f"Request resource: resource '{resource_id}' not registered.",
+                details={"app_id": app_id, "resource_id": resource_id, "decision": "RESOURCE_NOT_FOUND"},
+            ))
             return False
 
         # Ensure resource is in DB for FK compliance before RAAE may log conflicts
@@ -188,6 +202,11 @@ class SimulationController:
         self._log(SimEvent(
             "resource",
             f"🔒 App '{app.name}' requested {resource_id}: {status}",
+            details={
+                "app_id": app_id,
+                "resource_id": resource_id,
+                "decision": "ACQUIRED" if success else "WAITING",
+            },
         ))
         return success
 
@@ -195,7 +214,11 @@ class SimulationController:
         """Releases a resource lock held by an app."""
         app = self.mem_mgr.apps.get(app_id)
         if app is None:
-            self._log(SimEvent("error", f"Release resource: app '{app_id}' not found."))
+            self._log(SimEvent(
+                "error",
+                f"Release resource: app '{app_id}' not found.",
+                details={"app_id": app_id, "resource_id": resource_id, "decision": "APP_NOT_FOUND"},
+            ))
             return False
 
         success = self.res_mgr.release_resource(
@@ -205,6 +228,11 @@ class SimulationController:
         self._log(SimEvent(
             "resource",
             f"🔓 App '{app.name}' releasing {resource_id}: {status}",
+            details={
+                "app_id": app_id,
+                "resource_id": resource_id,
+                "decision": "RELEASED" if success else "NOT_HELD",
+            },
         ))
         return success
 
@@ -233,7 +261,10 @@ class SimulationController:
             kind,
             f"{icon} Clock tick → candidate='{candidate.name}' decision={decision}: {reason}",
             details={
+                "app_id": candidate.app_id,
                 "candidate_id": candidate.app_id,
+                "resource_id": result.held_resources[0].resource_id if result.held_resources else None,
+                "resource_ids": [resource.resource_id for resource in result.held_resources],
                 "decision": decision,
                 "reason": reason,
                 "held_resources": [r.resource_id for r in result.held_resources],
@@ -265,7 +296,11 @@ class SimulationController:
             return None
         event = self.gen.generate_random_event(self.mem_mgr, self.res_mgr)
         if event:
-            self._log(SimEvent("info", f"🎲 Random event: {event.event_type} on {event.app_id}"))
+            self._log(SimEvent(
+                "info",
+                f"🎲 Random event: {event.event_type} on {event.app_id}",
+                details={"app_id": event.app_id, "decision": event.event_type},
+            ))
             return event.event_type
         return None
 
@@ -318,6 +353,57 @@ class SimulationController:
     def get_recent_events(self, n: int = 20) -> List[SimEvent]:
         """Returns the last n simulation events (newest first)."""
         return list(reversed(self._events[-self.MAX_EVENTS:]))[:n]
+
+    def get_event_log(self, n: int = 20) -> List[Dict[str, Any]]:
+        """Returns recent events in a structured, display-ready form."""
+        app_names = {app.app_id: app.name for app in self.mem_mgr.apps.values()}
+        resource_names = {
+            resource.resource_id: resource.name
+            for resource in self.res_mgr.get_all_resources()
+        }
+        rows = []
+        for event in self.get_recent_events(n):
+            details = event.details or {}
+            app_id = details.get("app_id") or details.get("candidate_id")
+            resource_ids = details.get("resource_ids") or (
+                [details["resource_id"]] if details.get("resource_id") else []
+            )
+            rows.append({
+                "timestamp": event.timestamp,
+                "event_type": event.kind,
+                "message": event.message,
+                "app": (
+                    f"{app_names[app_id]} ({app_id})"
+                    if app_id in app_names else app_id
+                ),
+                "resource": ", ".join(
+                    f"{resource_names[resource_id]} ({resource_id})"
+                    if resource_id in resource_names else resource_id
+                    for resource_id in resource_ids
+                ) or None,
+                "decision": details.get("decision"),
+            })
+        return rows
+
+    def get_system_metrics(self) -> Dict[str, Any]:
+        """Returns current in-memory statistics and persisted event counts."""
+        apps = list(self.mem_mgr.apps.values())
+        metrics = {
+            **self.get_ram_snapshot(),
+            "total_apps": len(apps),
+            "active_apps": sum(app.is_active for app in apps),
+        }
+        try:
+            metrics["eviction_count"] = self.db.eviction_log.count_evictions()
+        except sqlite3.Error:
+            logger.exception("Unable to read the eviction count from the database.")
+            metrics["eviction_count"] = None
+        try:
+            metrics["conflict_count"] = self.db.conflict_log.count_conflicts()
+        except sqlite3.Error:
+            logger.exception("Unable to read the conflict count from the database.")
+            metrics["conflict_count"] = None
+        return metrics
 
     def get_available_resource_ids(self) -> List[str]:
         """Returns IDs of all registered resources."""
