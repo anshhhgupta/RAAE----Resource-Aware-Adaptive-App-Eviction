@@ -577,6 +577,43 @@ timestamp
 
 ---
 
+## Analytics (`db.analytics`)
+
+`database/analytics.py` holds the read-only aggregations behind the Phase-II dashboards. Every function returns a plain Python structure — an `int`, a `float`/`None`, or a `list` of `dict` with stable keys — so results drop straight into Streamlit widgets or Matplotlib series with no adapter. No `sqlite3.Row`, cursor or model object is ever returned. Nothing here writes.
+
+| Call | Returns |
+|---|---|
+| `total_eviction_count(result="EVICTED")` | `int`. Pass `result=None` to count every decision, including the `WAIT`/`CONFLICT` blocks. |
+| `total_evictions_by_result()` | `dict` of `result` → count, for an outcome-split bar chart. |
+| `total_freeze_incidents()` | `int` stranded waiters. |
+| `total_conflicts(freeze_only=False)` | `int` conflict incidents. |
+| `successful_resource_acquisitions()` | `int` granted lock requests. |
+| `resource_releases()` | `int` released lock requests. |
+| `queued_resource_requests()` | `int` blocked attempts, which hold no lock but still contended. |
+| `evictions_by_app(result="EVICTED", limit=None)` | `list[dict]`: `app_id`, `app_name`, `evictions`, `attempts`, `blocked`, `memory_freed_mb`. |
+| `evictions_by_resource(limit=None)` | `list[dict]`: `resource_id`, `resource_name`, `evictions`, `apps_evicted`. |
+| `conflicts_by_resource(limit=None)` | `list[dict]`: `resource_id`, `resource_name`, `conflicts`, `freezes`. |
+| `events_over_time(bucket_seconds=60, start=None, end=None)` | `list[dict]` timeline: `bucket_start`, `bucket_end`, plus `evictions`, `blocked_evictions`, `conflicts`, `freezes`, `grants`, `releases`, `memory_events`. |
+| `average_conflict_resolution_latency()` | `float` seconds, or `None` when no waiter was ever served. |
+| `conflict_resolution_samples(limit=None)` | `list[dict]` of the individual `queued_at` / `granted_at` / `latency_seconds` waits behind that average. |
+| `policy_comparison()` | `list[dict]` per algorithm: `algorithm`, `policy`, `evictions`, `attempts`, `blocked_evictions`, `safe_releases`, `evictions_without_safe_release`, `freeze_incidents`. |
+| `policy_delta()` | `dict` baseline-minus-RAAE difference, with `available: False` when either policy is missing. |
+| `summary()` | `dict` of every headline counter — one call for a metric row. |
+
+### Definitions worth knowing
+
+- **Freeze** — a conflict whose `details` opens with the `FREEZE` marker written by both freeze paths. The marker, not `resolution_strategy = 'NONE'`, identifies it, so an unrelated unresolved conflict is not miscounted as a stranded waiter.
+- **Latency** — `ConflictLog` stores one timestamp per incident, so it cannot express a duration on its own. The measurable wait is in `LockRequests`: the app was queued at its `QUEUED` request and served by the first `GRANTED` request after it for the same app and resource. Each queued request is charged its own wait. `None` is returned when nothing was ever served — that absence is itself the finding, and it is kept distinct from `0.0`.
+- **Evictions by resource** — `EvictionLog` records which app was considered, not which resource it held. `ResourceLocks` is the only normalized link between an app and the resources it held, so an eviction is attributed to every resource in that app's lock *history*. The figure is "evictions of apps that had held this resource", not "evictions caused by this resource" — the eviction that retires those locks clears the evidence in the same moment.
+- **`memory_freed_mb`** — the `memory_before - memory_after` delta of the app's `EVICT` MemoryEvents. It cannot be read off `Apps`, because eviction zeroes the persisted footprint in the same step that records the eviction.
+- **Policy names** — the active policy is stored as `EvictionLog.algorithm`: baseline writes `BASELINE_CLOCK`, the RAAE engine writes `RAAE_CLOCK`. Both are mapped to their policy name (`policy_comparison` and `policy_delta` only) so callers need not know the engine suffixes its own algorithm string.
+
+### Index use
+
+Every query filters or groups on an indexed column. Two indexes exist specifically for these aggregations: `idx_evictionlog_result_app` puts `result` first so both a `COUNT` and a `GROUP BY app_id` are served from one index, and `idx_conflictlog_freeze` is a partial index holding only freeze rows. The freeze predicate is written as a literal rather than a bind parameter because SQLite can only match a partial index when the query repeats the index predicate literally — binding it would silently downgrade the count to a full table scan. `tests/test_analytics.py` asserts the query plans for both, including a test that pins down why the parameter form fails.
+
+---
+
 ## Persistence Integration
 
 `backend/persistence_bridge.py` connects the simulation modules to the repositories. It exists to resolve two hooks the managers already called that matched no repository — `SemaphoreLock`'s `log_lock_request` and `MemoryManager.get_pressure_level`'s `log_memory_pressure` — without rewriting either module.

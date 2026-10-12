@@ -14,6 +14,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from backend.models.app import App
 from backend.models.resource import Resource
+from database.analytics import AnalyticsRepository
 from database.event_feed import EventRepository
 from database.repositories import (
     AppRepository,
@@ -67,6 +68,7 @@ class DatabaseManager:
         self.lock_requests = LockRequestRepository(self)
         self.system_events = SystemEventRepository(self)
         self.events = EventRepository(self)
+        self.analytics = AnalyticsRepository(self)
 
         self.init_db()
 

@@ -188,6 +188,12 @@ CREATE INDEX IF NOT EXISTS idx_evictionlog_algorithm ON EvictionLog(algorithm);
 CREATE INDEX IF NOT EXISTS idx_evictionlog_timestamp ON EvictionLog(timestamp);
 CREATE INDEX IF NOT EXISTS idx_evictionlog_app_ts ON EvictionLog(app_id, timestamp DESC);
 
+-- EvictionLog: outcome-driven analytics. Every dashboard headline number is a
+-- filter on `result` ('EVICTED', 'WAIT', 'CONFLICT', ...), so `result` leads the
+-- key and lets SQLite answer both a COUNT and a GROUP BY app_id from one index
+-- instead of scanning the log.
+CREATE INDEX IF NOT EXISTS idx_evictionlog_result_app ON EvictionLog(result, app_id);
+
 -- ConflictLog: resource_id, both participating apps and event type
 CREATE INDEX IF NOT EXISTS idx_conflictlog_resource ON ConflictLog(resource_id);
 CREATE INDEX IF NOT EXISTS idx_conflictlog_waiting ON ConflictLog(waiting_app_id);
@@ -195,6 +201,13 @@ CREATE INDEX IF NOT EXISTS idx_conflictlog_blocking ON ConflictLog(blocking_app_
 CREATE INDEX IF NOT EXISTS idx_conflictlog_strategy ON ConflictLog(resolution_strategy);
 CREATE INDEX IF NOT EXISTS idx_conflictlog_timestamp ON ConflictLog(timestamp);
 CREATE INDEX IF NOT EXISTS idx_conflictlog_resource_ts ON ConflictLog(resource_id, timestamp DESC);
+
+-- ConflictLog: freeze detection. A freeze is a conflict whose `details` opens
+-- with the FREEZE marker written by the baseline eviction path, so a partial
+-- index holding only those rows answers the freeze count without touching the
+-- Wound-Wait rows that make up the rest of the table.
+CREATE INDEX IF NOT EXISTS idx_conflictlog_freeze ON ConflictLog(conflict_id)
+    WHERE details LIKE 'FREEZE%';
 
 -- LockRequests: request history by app, by resource, by outcome and by time
 CREATE INDEX IF NOT EXISTS idx_lockrequests_app ON LockRequests(app_id);
@@ -296,8 +309,64 @@ BEGIN
                              WHERE l.resource_id = OLD.resource_id AND l.status = 'HELD') THEN 'LOCKED'
                ELSE 'FREE'
            END
-     WHERE resource_id = OLD.resource_id;
+      WHERE resource_id = OLD.resource_id;
 END;
+
+-- Resources: repair the ledger-derived columns after a direct Resources UPDATE.
+--
+-- The three triggers above only fire when a *lock row* changes, so they leave a
+-- gap: a writer that updates Resources itself can set available_units,
+-- held_by_app_id or status to anything, and a capacity change invalidates the
+-- stored values without touching ResourceLocks at all. Both paths broke the
+-- invariant the header of this file promises, because
+-- available_units = capacity - SUM(units over HELD locks) is then false.
+--
+-- This trigger closes that gap. It compares the incoming row against the same
+-- three expressions and rewrites the row only when they disagree, so it is a
+-- no-op for the three triggers above (they already write agreeing values) and
+-- for any writer that persisted a correct row. That also makes it terminate:
+-- the repair UPDATE makes the row agree, so the WHEN clause is false on the
+-- next evaluation and nothing recurses.
+--
+-- NOT covered, deliberately: AFTER INSERT. create_resource() is legitimately
+-- used to insert a resource that is already held (available_units = 0 plus a
+-- held_by_app_id) with no ResourceLocks row behind it, so re-deriving on insert
+-- would discard a state the repository API promises to persist. Rows are
+-- therefore correct as inserted and kept correct from the first UPDATE on.
+
+CREATE TRIGGER IF NOT EXISTS trg_resources_repair_derived
+AFTER UPDATE ON Resources
+WHEN NEW.available_units IS NOT MAX(NEW.capacity - COALESCE((
+         SELECT SUM(l.units) FROM ResourceLocks AS l
+          WHERE l.resource_id = NEW.resource_id AND l.status = 'HELD'), 0), 0)
+  OR NEW.held_by_app_id IS NOT (
+         SELECT l.app_id FROM ResourceLocks AS l
+          WHERE l.resource_id = NEW.resource_id AND l.status = 'HELD'
+          ORDER BY l.acquired_at ASC, l.lock_id ASC LIMIT 1)
+  OR NEW.status IS NOT (CASE
+         WHEN TRIM(COALESCE(NEW.waiting_queue, '')) <> '' THEN 'WAITING'
+         WHEN EXISTS (SELECT 1 FROM ResourceLocks AS l
+                       WHERE l.resource_id = NEW.resource_id AND l.status = 'HELD') THEN 'LOCKED'
+         ELSE 'FREE'
+     END)
+BEGIN
+    UPDATE Resources
+       SET available_units = MAX(NEW.capacity - COALESCE((
+               SELECT SUM(l.units) FROM ResourceLocks AS l
+                WHERE l.resource_id = NEW.resource_id AND l.status = 'HELD'), 0), 0),
+           held_by_app_id = (
+               SELECT l.app_id FROM ResourceLocks AS l
+                WHERE l.resource_id = NEW.resource_id AND l.status = 'HELD'
+                ORDER BY l.acquired_at ASC, l.lock_id ASC LIMIT 1),
+           status = CASE
+               WHEN TRIM(COALESCE(NEW.waiting_queue, '')) <> '' THEN 'WAITING'
+               WHEN EXISTS (SELECT 1 FROM ResourceLocks AS l
+                             WHERE l.resource_id = NEW.resource_id AND l.status = 'HELD') THEN 'LOCKED'
+               ELSE 'FREE'
+           END
+     WHERE resource_id = NEW.resource_id;
+END;
+
 
 -- Initial Seed Data for Resources (Idempotent: INSERT OR IGNORE)
 INSERT OR IGNORE INTO Resources (resource_id, name, capacity, available_units, status, held_by_app_id, waiting_queue) VALUES
