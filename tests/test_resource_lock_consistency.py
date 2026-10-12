@@ -606,5 +606,121 @@ class TestSemaphoreLedgerSynchronization(ResourceLockTestCase):
         self.assertEqual(self.db.resource_locks.get_active_locks(), [])
 
 
+class TestResourceRepairTrigger(ResourceLockTestCase):
+    """A direct Resources write cannot leave the ledger-derived columns wrong.
+
+    The three ledger triggers only fire when a lock row changes. These cover the
+    remaining writer: anything that updates Resources itself.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.db.save_resource(Resource("SHARED", "Shared Pool", capacity=3))
+
+    def derived(self, resource_id="SHARED"):
+        """Returns only the columns the ledger is supposed to own."""
+        row = self.resource_row(resource_id)
+        return {k: row[k] for k in ("capacity", "available_units", "held_by_app_id", "status")}
+
+    def test_repair_trigger_is_declared_by_the_schema(self):
+        """Test that the Resources-side trigger exists after initialization."""
+        self.assertIn("trg_resources_repair_derived", self.trigger_names())
+
+    def test_capacity_change_recomputes_the_derived_columns(self):
+        """Test that raising capacity does not strand the old available_units."""
+        self.db.acquire_resource_lock("app_a", "SHARED", units=2)
+
+        self.db.save_resource(Resource("SHARED", "Shared Pool", capacity=5))
+
+        self.assertEqual(
+            self.derived(),
+            {
+                "capacity": 5,
+                "available_units": 3,
+                "held_by_app_id": "app_a",
+                "status": "LOCKED",
+            },
+        )
+
+    def test_saving_a_stale_model_cannot_orphan_a_held_lock(self):
+        """Test that overwriting the row with a default model does not free it.
+
+        This is the case the ledger triggers cannot see: the lock rows never
+        change, so only a trigger on Resources can notice that the row now
+        disagrees with them.
+        """
+        self.db.acquire_resource_lock("app_a", "SHARED")
+
+        self.db.save_resource(Resource("SHARED", "Shared Pool", capacity=3))
+
+        self.assertEqual(self.derived()["available_units"], 2)
+        self.assertEqual(self.derived()["held_by_app_id"], "app_a")
+        self.assertEqual(self.derived()["status"], "LOCKED")
+
+    def test_direct_sql_tampering_is_repaired(self):
+        """Test that hand-written UPDATE SQL is corrected by the database."""
+        self.db.acquire_resource_lock("app_a", "SHARED")
+
+        self.db.get_connection().execute(
+            "UPDATE Resources SET available_units = 99, status = 'FREE', "
+            "held_by_app_id = NULL WHERE resource_id = 'SHARED'"
+        )
+
+        self.assertEqual(self.derived()["available_units"], 2)
+        self.assertEqual(self.derived()["held_by_app_id"], "app_a")
+        self.assertEqual(self.derived()["status"], "LOCKED")
+
+    def test_waiting_queue_change_recomputes_status(self):
+        """Test that a queue change is reflected in the derived status column."""
+        self.db.acquire_resource_lock("app_a", "SHARED")
+
+        self.db.get_connection().execute(
+            "UPDATE Resources SET waiting_queue = 'app_b' WHERE resource_id = 'SHARED'"
+        )
+        self.assertEqual(self.derived()["status"], "WAITING")
+
+        self.db.get_connection().execute(
+            "UPDATE Resources SET waiting_queue = '' WHERE resource_id = 'SHARED'"
+        )
+        self.assertEqual(self.derived()["status"], "LOCKED")
+
+    def test_repair_is_a_no_op_when_the_row_already_agrees(self):
+        """Test that a correct write is left exactly as written."""
+        self.db.acquire_resource_lock("app_a", "SHARED")
+        before = self.derived()
+
+        self.db.save_resource(Resource("SHARED", "Shared Pool", capacity=3))
+
+        self.assertEqual(self.derived(), before)
+
+    def test_repair_terminates_rather_than_recursing(self):
+        """Test that correcting a row does not re-enter the trigger forever."""
+        self.db.acquire_resource_lock("app_a", "SHARED")
+
+        self.db.get_connection().execute(
+            "UPDATE Resources SET available_units = 99 WHERE resource_id = 'SHARED'"
+        )
+
+        # A runaway trigger would raise "too many levels of trigger recursion".
+        self.assertEqual(self.derived()["available_units"], 2)
+
+    def test_inserted_rows_are_not_rewritten(self):
+        """Test that create_resource may store an already-held resource.
+
+        Resources inserted in that state have no ResourceLocks rows behind them,
+        so re-deriving on INSERT would discard a state the repository promises to
+        persist. The repair trigger is deliberately UPDATE-only.
+        """
+        self.db.create_app(App(app_id="app_pre", name="Pre"))
+        held = Resource("PRE", "Pre Held", capacity=1, available_units=0)
+        held.holders["app_pre"] = 1
+        self.db.create_resource(held)
+
+        row = self.resource_row("PRE")
+        self.assertEqual(row["available_units"], 0)
+        self.assertEqual(row["held_by_app_id"], "app_pre")
+        self.assertEqual(row["status"], "LOCKED")
+
+
 if __name__ == "__main__":
     unittest.main()

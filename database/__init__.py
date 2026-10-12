@@ -5,6 +5,13 @@ one repository per table.
 """
 
 from .db import DatabaseManager
+from .analytics import (
+    DEFAULT_BUCKET_SECONDS,
+    FREEZE_MARKER,
+    POLICY_BASELINE,
+    POLICY_RAAE,
+    AnalyticsRepository,
+)
 from .event_feed import (
     CONFLICT_EVENT,
     EVENT_TYPES,
@@ -30,6 +37,7 @@ from .transaction import (
 
 __all__ = [
     "DatabaseManager",
+    "AnalyticsRepository",
     "BaseRepository",
     "AppRepository",
     "ResourceRepository",
@@ -46,4 +54,8 @@ __all__ = [
     "MEMORY_EVENT",
     "EVICTION_EVENT",
     "CONFLICT_EVENT",
+    "FREEZE_MARKER",
+    "DEFAULT_BUCKET_SECONDS",
+    "POLICY_BASELINE",
+    "POLICY_RAAE",
 ]
