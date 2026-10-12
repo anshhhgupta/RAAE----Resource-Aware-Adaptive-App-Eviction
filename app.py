@@ -25,8 +25,15 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 import streamlit as st
+import matplotlib.pyplot as plt
 
 from backend.models.app import AppState
+from backend.policy_evaluation import (
+    PolicyComparison,
+    UnsupportedWorkloadError,
+    compare_eviction_policies,
+)
+from backend.phase2_resources import register_demo_resources
 from backend.simulation_controller import SimulationController
 
 # ---------------------------------------------------------------------------
@@ -48,6 +55,7 @@ if "ctrl" not in st.session_state:
     st.session_state.ctrl = SimulationController()
 
 ctrl: SimulationController = st.session_state.ctrl
+register_demo_resources(ctrl.res_mgr)
 
 # ---------------------------------------------------------------------------
 # Helper: pressure colour
@@ -299,6 +307,140 @@ else:
         row["Decision"] = row.pop("decision") or "—"
         row["Details"] = row.pop("message")
     st.dataframe(event_rows, use_container_width=True, hide_index=True)
+
+st.divider()
+
+# ============================================================================
+# ⑧ CLOCK VS RAAE EVALUATION
+# ============================================================================
+
+st.subheader("⚖️ Clock vs RAAE Evaluation")
+st.caption(
+    "Evaluate the current app/resource snapshot on independent copies. Both policies "
+    "receive the same Clock-attempt limit; evaluation does not change the live simulation "
+    "or inject random events."
+)
+
+active_app_count = sum(app.is_active for app in ctrl.mem_mgr.apps.values())
+with st.form("policy_evaluation_form"):
+    max_attempts = st.number_input(
+        "Maximum eviction attempts per policy",
+        min_value=1,
+        max_value=100,
+        value=10,
+        step=1,
+        help="Both policies stop at this limit or when no active app remains.",
+    )
+    evaluate = st.form_submit_button(
+        "Run Clock vs RAAE evaluation",
+        disabled=active_app_count == 0,
+        use_container_width=True,
+    )
+
+if active_app_count == 0:
+    st.info("Add at least one active app to run a policy comparison.")
+
+if evaluate:
+    st.session_state.pop("policy_comparison", None)
+    try:
+        comparison = compare_eviction_policies(
+            apps=list(ctrl.mem_mgr.apps.values()),
+            resources=ctrl.res_mgr.get_all_resources(),
+            total_memory=ctrl.mem_mgr.total_memory,
+            clock_hand=ctrl.mem_mgr.clock_hand,
+            max_attempts=int(max_attempts),
+        )
+    except UnsupportedWorkloadError as exc:
+        st.warning(f"Comparison unavailable: {exc}")
+    else:
+        st.session_state.policy_comparison = comparison
+        st.session_state.policy_comparison_time = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+comparison: PolicyComparison | None = st.session_state.get("policy_comparison")
+if comparison is not None:
+    st.caption(
+        f"Snapshot evaluated at {st.session_state.policy_comparison_time} · "
+        f"{comparison.initial_active_app_count} active of {comparison.initial_app_count} apps · "
+        f"{comparison.initial_used_memory_mb} MB active RAM · "
+        f"{comparison.max_attempts} maximum attempts per policy."
+    )
+
+    def _latency_label(metrics) -> str:
+        if metrics.conflict_case_orchestration_latency_ms is None:
+            if metrics.policy == "Plain Clock":
+                return "N/A — no conflict resolver"
+            return "N/A — no conflict case measured"
+        return f"{metrics.conflict_case_orchestration_latency_ms:.6f} ms average"
+
+    metric_rows = [
+        {
+            "Policy": metrics.policy,
+            "Eviction count": metrics.eviction_count,
+            "Simulated wait/freeze proxy": metrics.simulated_wait_freeze_proxy_count,
+            "Logged conflict outcomes": metrics.logged_conflict_outcomes,
+            "Passive contention observations": metrics.passive_contention_observations,
+            "Conflict-case orchestration latency": _latency_label(metrics),
+            "Resource-blocked evictions": metrics.resource_blocked_evictions,
+            "Attempts": metrics.attempts,
+        }
+        for metrics in (comparison.plain_clock, comparison.raae)
+    ]
+    st.dataframe(metric_rows, use_container_width=True, hide_index=True)
+
+    st.caption(
+        "Definitions: eviction count is successful evictions recorded in each isolated run; "
+        "logged conflict outcomes count Wound-Wait outcomes written to the isolated ConflictLog; "
+        "passive contention observations count selected-candidate/resource pairs with active "
+        "holder/waiter contention and are not conflict-manager decisions. The simulated "
+        "wait/freeze proxy counts RAAE WAIT decisions; it does not establish a real freeze. "
+        "Resource-blocked evictions count non-eviction decisions with a resource ID and status "
+        "WAIT, RESOLVE_REQUIRED, BLOCKED, or NOT_SAFE. Latency is average engine orchestration "
+        "time for conflict cases, not isolated resolver execution time; it is unavailable when "
+        "no conflict case was measured. Plain Clock has no conflict resolver."
+    )
+
+    chart_columns = st.columns(3)
+    chart_specs = [
+        ("Eviction count: Clock vs RAAE", "Evictions", "eviction_count"),
+        (
+            "Simulated wait/freeze proxy: Clock vs RAAE",
+            "Simulated wait/freeze proxy decisions",
+            "simulated_wait_freeze_proxy_count",
+        ),
+        (
+            "Logged conflict outcomes: Clock vs RAAE",
+            "Wound-Wait outcomes logged",
+            "logged_conflict_outcomes",
+        ),
+    ]
+    policy_results = (comparison.plain_clock, comparison.raae)
+    for column, (title, y_label, attribute) in zip(chart_columns, chart_specs):
+        figure, axis = plt.subplots(figsize=(4.5, 3.5))
+        values = [getattr(result, attribute) for result in policy_results]
+        bars = axis.bar(
+            ["Plain Clock", "RAAE"],
+            values,
+            color=["#4C78A8", "#F58518"],
+            label=["Plain Clock", "RAAE"],
+        )
+        axis.set_title(title)
+        axis.set_xlabel("Eviction policy")
+        axis.set_ylabel(y_label)
+        axis.set_ylim(bottom=0, top=max(values, default=0) + 1)
+        axis.bar_label(bars, fmt="%d")
+        axis.legend()
+        column.pyplot(figure)
+        plt.close(figure)
+
+    st.info(
+        "Fairness note: both trials clone the same in-memory app states, priorities, memory "
+        "footprints, reference bits, Clock hand, resource holders, and waiting queues before "
+        "either policy runs. The controller does not retain a complete replayable history of "
+        "resource requests or other workload operations, so this is a fixed-snapshot eviction "
+        "comparison, not a replay of prior operations."
+    )
 
 st.divider()
 

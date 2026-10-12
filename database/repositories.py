@@ -9,11 +9,14 @@ Provides clean CRUD and query interfaces for all 6 database tables:
 6. ConflictLog
 """
 
+import logging
 import time
 import sqlite3
 from typing import List, Optional, Dict, Any, Union
 from backend.models.app import App, AppState, AppStatus
 from backend.models.resource import Resource, ResourceStatus
+
+logger = logging.getLogger(__name__)
 
 
 class BaseRepository:
@@ -342,20 +345,27 @@ class EvictionLogRepository(BaseRepository):
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """
         ts = timestamp if timestamp is not None else time.time()
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                sql,
-                (
-                    str(app_id),
-                    str(algorithm),
-                    str(reason),
-                    1 if lock_checked else 0,
-                    1 if safe_release else 0,
-                    str(result),
-                    float(ts)
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.execute(
+                    sql,
+                    (
+                        str(app_id),
+                        str(algorithm),
+                        str(reason),
+                        1 if lock_checked else 0,
+                        1 if safe_release else 0,
+                        str(result),
+                        float(ts)
+                    )
                 )
+                return cursor.lastrowid
+        except sqlite3.Error:
+            logger.exception(
+                "Unable to persist eviction log for app %s.",
+                app_id,
             )
-            return cursor.lastrowid
+            raise
 
     def get_evictions_by_app(self, app_id: str) -> List[Dict[str, Any]]:
         """Retrieves eviction records for a specific app."""
