@@ -798,6 +798,58 @@ RAAE aims to:
 
 ---
 
+# 🖥️ Interactive Streamlit Dashboard
+
+RAAE includes a full interactive Streamlit dashboard featuring custom dark mode styling, real-time memory monitoring, algorithm comparison, and deep analytics.
+
+### Launching the Dashboard
+
+```bash
+# 1. Install dependencies
+pip install -r requirements.txt
+
+# 2. Run the automated test suite
+pytest tests/test_end_to_end_scenario.py -v
+
+# 3. Launch the Streamlit application
+streamlit run app.py
+```
+
+### Dashboard Views
+1. **🏠 Overview**: System-monitoring dashboard — header (simulation status, tick, selected policy), metric cards (total/used/available RAM, utilization, active apps, evictions, conflicts), memory monitor (RAM bar, pressure indicator, used-vs-available gauge, utilization chart over ticks), application summary, and a filterable event log with timestamp, type, app, resource, decision and explanation. Every figure is read live from the backend or SQLite; anything unreadable is shown as **Unavailable** with its origin listed in the "Data availability" panel.
+2. **📱 Applications**: Create applications (name, footprint, priority 1–5, initial state) and drive the backend against them — change priority, move between foreground and background, simulate an access or set the reference bit, and request or release a lock on Camera, Microphone, GPS or Audio. Every action reports what the backend actually did, refuses inputs it cannot accept (blank names, negative footprints, out-of-band priorities, footprints larger than free memory), and disables the controls the backend cannot honour — such as changing the state of an app queued for a contended resource. Includes the full application table and a detail inspector with lock, queue and eviction-history data.
+3. **⚙️ Simulation**: Runs the real eviction workflow under your control — Start, Pause, Resume, Stop, Reset, advance one tick or many, trigger memory pressure, and choose BASELINE_CLOCK or RAAE. Ticks execute on demand (no background threads), and the controls are enabled from the run's actual status so an invalid transition cannot be taken. Shows the current tick, status, total/used/available RAM, active applications, the selected policy and the most recent eviction decision, plus an eight-step **decision timeline** — pressure → Clock selection → RAAE resource check → Conflict Manager → Wound-Wait → release/waiting → eviction outcome → persistence — where each step is marked *Confirmed*, *Not executed*, *Not applicable* or *Unavailable* according to the events the run actually produced. Every run writes its own SQLite log under `database/runs/`, and Reset keeps those files and lists them in the run history.
+4. **🔒 Resources**: Real-time semaphore monitor for the four hardware resources (`Camera`, `Microphone`, `GPS`, `Audio`). Displays resource status (name, holder, free/locked, waiting queue, queued count, single-holder integrity check), interactive controls to request/release locks via the ResourceManager, conflict monitor tracking requesting app, holder, priority/timestamps, Wound-Wait decisions (`WOUND_HOLDER`, `WAIT`, `NO_CONFLICT`), reason, and actual resolution outcomes, plus recent conflict events from SQLite `ConflictLog`.
+5. **📈 Analytics & Insights**: Empirical comparison between `BASELINE_CLOCK` and `RAAE` under identical reproducible workloads (deterministic or seeded synthetic traces). Displays side-by-side metric tiles (evictions, blocked attempts, conflicts, freezes, latency, memory utilization, releases), an unbiased empirical comparison table, and five dark-themed Matplotlib charts: (1) Eviction counts comparison, (2) Resource conflicts, (3) Freeze incidents, (4) Memory utilization over time, and (5) Eviction events across simulation ticks.
+
+---
+
+## 🧪 Step-by-Step Demonstration Guide
+
+Follow this end-to-end evaluation flow to observe RAAE's resource-aware adaptive eviction, deadlock avoidance, and live telemetry:
+
+| Step | Action / Page | Expected Observation | Backend Verification |
+|:---:|:---|:---|:---|
+| **1** | **Launch App** (`streamlit run app.py`) | Streamlit opens at `http://localhost:8501`. Dark-themed layout loads with sidebar navigation, live SQLite connection, and status metrics. | `DatabaseManager` connects, default resources (`Camera`, `Microphone`, `GPS`, `Audio`) initialized. |
+| **2** | **Applications Page** → Create Apps | Register 3 applications: <br>• **Maps** (300 MB, Priority 3, Background)<br>• **Fitness** (250 MB, Priority 2, Background)<br>• **Music** (300 MB, Priority 1, Background) | Validated via `ui/app_actions.py`, registered in `MemoryManager` & persisted in SQLite. |
+| **3** | **Overview Page** → Verify RAM | Used RAM shows **850 MB / 1000 MB** (85.0% utilization). Pressure gauge displays **ORANGE** warning (`is_under_pressure() == True`). | `MemoryManager.get_pressure_level()` returns `ORANGE`. |
+| **4** | **Resources Page** → Lock Allocation | Under *Lock Allocation Controls*:<br>• Grant `Camera` and `GPS` to `Maps`<br>• Grant `Audio` and `Microphone` to `Fitness` | `ResourceManager.request_resource()` acquires hardware locks and updates `holders`. |
+| **5** | **Resources Page** → Resource Queue | Request `GPS` for `Music` (Priority 1). Notice `GPS` is already held by `Maps` (Priority 3). Request is denied and `Music` transitions to `WAITING`. | Single-holder semaphore integrity holds: `GPS` holder is `Maps`, waiting queue contains `(app_music, Music)`. |
+| **6** | **Simulation Page** → Memory Pressure | Trigger simulation memory pressure (target threshold 75–85%). | Pressure detected (`usage >= 75%`). Simulation tick loop triggers candidate search. |
+| **7** | **Simulation Page** → Clock Selection | Advance 1 tick under `RAAE`. Clock hand scans circular buffer and identifies background candidate with reference bit 0. | `MemoryManager.clock_step()` selects candidate (`Maps` or `Music`). |
+| **8** | **Simulation Page** → RAAE Resource Check | Timeline Step 3 highlights *Confirmed*: RAAE identifies candidate's held hardware resources before any eviction decision. | `sim.get_candidate_resources()` exposes candidate locks. |
+| **9** | **Resources Page** → Conflict Monitor | Live conflict detected on `GPS`: Requester `Music` (P1) vs Holder `Maps` (P3). | `ResourceConflictManager` identifies contested semaphore. |
+| **10** | **Resources Page** → Wound-Wait Adjudication | Adjudication shows `WAIT` (Requester P1 < Holder P3; younger/lower priority requester waits, older/higher priority holder continues). No preemptive wound. | Wound-Wait algorithm in `ResourceConflictManager.resolve_conflict()` evaluates priorities correctly. |
+| **11** | **Resources Page** → Safe Release | Select `Maps` and release `GPS`. Semaphore immediately awakens `Music`, transitions `Music` back to `BACKGROUND`, and promotes it as the new holder of `GPS`. | `ResourceManager.release_resource()` promotes head of queue; zero integrity problems. |
+| **12** | **Simulation Page** → Valid Eviction | Complete eviction of `Maps`. Remaining held resource (`Camera`) is safely released first, preventing orphaned locks, then `Maps` memory footprint is freed. | `MemoryManager.evict_app()` sets memory footprint to 0 and state to `EVICTED`. |
+| **13** | **Overview Page** → RAM Accounting | Used RAM drops from 850 MB to 550 MB. `Maps` is removed from active apps. `Camera` is completely free (0 holders). | Memory accounting matches: `1000 - 450 = 550 MB free`. |
+| **14** | **Overview Page** → SQLite Persistence | Confirm eviction record is persisted in SQLite with `algorithm="RAAE"`, `lock_checked=1`, and `safe_release=1`. | SQLite query on `EvictionLog` verifies persisted record. |
+| **15** | **Overview Page** → Event Timeline | The unified SQLite Event Feed displays memory, lock, and eviction events in reverse-chronological order. | `DatabaseManager.get_recent_events()` returns actual history. |
+| **16** | **Analytics Page** → Policy Comparison | Select Deterministic Workload (1000 MB RAM, 75% threshold, 1 tick). Run comparison. | `BASELINE_CLOCK` blindly kills holder causing **1 Freeze Incident**; `RAAE` inspects locks and achieves **0 Freeze Incidents**. |
+| **17** | **Analytics Page** → Telemetry Charts | Inspect 5 Matplotlib charts: Eviction Counts, Resource Conflicts, Freeze Incidents, Memory Utilization Over Time, and Eviction Timeline. | Visual confirmation of freeze prevention and safe lock handoff under identical initial states. |
+
+---
+
 # 👨‍💻 Future Scope
 
 Possible future improvements:

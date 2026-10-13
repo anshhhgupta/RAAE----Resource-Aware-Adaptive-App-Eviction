@@ -230,6 +230,44 @@ class TestDatabaseManager(unittest.TestCase):
         self.assertEqual(conflicts[0]["waiting_app_id"], "app_conf_2")
         self.assertEqual(conflicts[0]["blocking_app_id"], "app_conf_1")
 
+    def test_connection_is_usable_from_another_thread(self):
+        """A manager kept in session state must survive a rerun on a new thread.
+
+        The Streamlit app holds one DatabaseManager per session and reuses it
+        across reruns. SQLite refuses a connection used from a thread other than
+        the one that opened it, so the manager opens with check_same_thread=False
+        and this test pins that behaviour.
+        """
+        import os
+        import tempfile
+        import threading
+
+        path = os.path.join(tempfile.mkdtemp(), "threaded.db")
+        db = DatabaseManager(db_path=path)
+        try:
+            db.save_app(App(app_id="app_thread", name="Threaded", priority=2))
+
+            outcome = {}
+
+            def read_from_another_thread():
+                try:
+                    outcome["rows"] = db.apps.get_all_apps()
+                except Exception as error:  # noqa: BLE001 - recorded for the assert
+                    outcome["error"] = error
+
+            thread = threading.Thread(target=read_from_another_thread)
+            thread.start()
+            thread.join()
+
+            self.assertNotIn("error", outcome, f"cross-thread read failed: {outcome.get('error')}")
+            self.assertTrue(outcome.get("rows"), "the cross-thread read returned no rows")
+
+            # The row written on this thread is still there.
+            stored = db.get_app("app_thread")
+            self.assertIsNotNone(stored)
+            self.assertEqual(stored.name, "Threaded")
+        finally:
+            db.close()
 
 
 if __name__ == "__main__":

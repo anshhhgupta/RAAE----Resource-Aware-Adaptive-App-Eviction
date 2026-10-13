@@ -73,8 +73,16 @@ class DatabaseManager:
         self.init_db()
 
     def _open_connection(self) -> sqlite3.Connection:
-        """Opens a connection configured with Row factory and foreign key enforcement."""
-        conn = sqlite3.connect(self.db_path)
+        """Opens a connection configured with Row factory and foreign key enforcement.
+
+        ``check_same_thread=False`` is required because the Streamlit app keeps a
+        ``DatabaseManager`` in session state, and SQLite otherwise refuses any use
+        of the connection from the thread that later executes a rerun. It is safe
+        here because each session owns its own manager and Streamlit runs one
+        script at a time per session, so two threads never write through the same
+        connection.
+        """
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
         return conn

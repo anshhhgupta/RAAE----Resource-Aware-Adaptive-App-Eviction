@@ -1,0 +1,8 @@
+# RAAE — Resource-Aware Adaptive App Eviction
+# Core dependencies
+matplotlib>=3.7
+
+# Frontend / Dashboard
+streamlit>=1.30
+plotly>=5.18
+pandas>=2.0
