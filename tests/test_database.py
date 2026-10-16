@@ -117,6 +117,15 @@ class TestDatabaseManager(unittest.TestCase):
         self.assertEqual(retrieved.status, AppStatus.EVICTED)
         self.assertTrue(retrieved.is_evicted)
 
+    def test_transaction_rolls_back_repository_operations(self):
+        """Test that repository operations inside a transaction roll back atomically."""
+        with self.assertRaises(RuntimeError):
+            with self.db.transaction():
+                self.db.save_app(App(app_id="app_tx_rollback", name="Rollback App"))
+                raise RuntimeError("force rollback")
+
+        self.assertIsNone(self.db.get_app("app_tx_rollback"))
+
     def test_get_all_apps_and_delete(self):
         """Test fetching all apps and deleting an app."""
         app1 = App(app_id="app_1", name="App 1")
@@ -142,6 +151,15 @@ class TestDatabaseManager(unittest.TestCase):
         self.assertEqual(retrieved.resource_id, "GPS")
         self.assertEqual(retrieved.capacity, 1)
         self.assertEqual(retrieved.waiting_queue, ["app_2", "app_3"])
+
+    def test_log_memory_action_uses_provided_timestamp(self):
+        """Test that a supplied memory action timestamp is persisted."""
+        self.db.save_app(App(app_id="app_1", name="Timestamp App"))
+        self.db.log_memory_action("app_1", "ALLOCATE", 100, 150, "GREEN", timestamp=123.5)
+
+        logs = self.db.get_all_memory_logs()
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0]["timestamp"], 123.5)
 
     def test_resource_locks_repository(self):
         """Test acquiring and releasing resource locks via ResourceLockRepository."""
@@ -223,6 +241,45 @@ class TestDatabaseManager(unittest.TestCase):
         self.assertEqual(conflicts[0]["waiting_app_id"], "app_conf_2")
         self.assertEqual(conflicts[0]["blocking_app_id"], "app_conf_1")
         self.assertEqual(self.db.conflict_log.count_conflicts(), 1)
+
+    def test_connection_is_usable_from_another_thread(self):
+        """A manager kept in session state must survive a rerun on a new thread.
+
+        The Streamlit app holds one DatabaseManager per session and reuses it
+        across reruns. SQLite refuses a connection used from a thread other than
+        the one that opened it, so the manager opens with check_same_thread=False
+        and this test pins that behaviour.
+        """
+        import os
+        import tempfile
+        import threading
+
+        path = os.path.join(tempfile.mkdtemp(), "threaded.db")
+        db = DatabaseManager(db_path=path)
+        try:
+            db.save_app(App(app_id="app_thread", name="Threaded", priority=2))
+
+            outcome = {}
+
+            def read_from_another_thread():
+                try:
+                    outcome["rows"] = db.apps.get_all_apps()
+                except Exception as error:  # noqa: BLE001 - recorded for the assert
+                    outcome["error"] = error
+
+            thread = threading.Thread(target=read_from_another_thread)
+            thread.start()
+            thread.join()
+
+            self.assertNotIn("error", outcome, f"cross-thread read failed: {outcome.get('error')}")
+            self.assertTrue(outcome.get("rows"), "the cross-thread read returned no rows")
+
+            # The row written on this thread is still there.
+            stored = db.get_app("app_thread")
+            self.assertIsNotNone(stored)
+            self.assertEqual(stored.name, "Threaded")
+        finally:
+            db.close()
 
 
 if __name__ == "__main__":

@@ -91,6 +91,37 @@ def main():
     for dba in all_db_apps:
         print(f"    DB App Record: ID={dba.app_id}, Name={dba.name}, Priority={dba.priority}, State={dba.state.value}, Status={dba.status.value}")
 
+    # 8. Integrated Simulation Workflow (SimulationState)
+    print("\n[8] Demonstrating Integrated Simulation Workflow (SimulationState):")
+    from backend.simulation import SimulationState
+
+    sim = SimulationState(memory_manager=MemoryManager(total_memory=1000), resource_manager=res_mgr)
+    
+    app_a = App(app_id="AppA", name="Navigation", state=AppState.BACKGROUND, memory_footprint=200, reference_bit=1)
+    app_b = App(app_id="AppB", name="Voice Recorder", state=AppState.BACKGROUND, memory_footprint=200, reference_bit=1)
+    app_c = App(app_id="AppC", name="Calculator", state=AppState.BACKGROUND, memory_footprint=200, reference_bit=0)
+
+    sim.add_app(app_a)
+    sim.add_app(app_b)
+    sim.add_app(app_c)
+
+    sim.request_resource("AppA", "Camera")
+    sim.request_resource("AppB", "Microphone")
+
+    sim.trigger_memory_pressure(target_percentage=85.0)
+    sim.update_reference_bit("AppA", 1)
+    sim.update_reference_bit("AppB", 1)
+    sim.update_reference_bit("AppC", 0)
+
+    candidate = sim.select_eviction_candidate()
+    candidate_res = sim.get_candidate_resources(candidate) if candidate else []
+
+    print(f"    Memory Pressure Level: {sim.memory_manager.get_pressure_level().value}")
+    print(f"    Selected Clock Eviction Candidate: {candidate.name} (ID: {candidate.app_id})")
+    print(f"    Candidate is_active (Not prematurely evicted): {candidate.is_active}")
+    print(f"    Candidate Held Resources: {candidate_res}")
+    print(f"    Active Locks in System: {sim.resource_manager.get_all_active_locks()}")
+
     print("\n=" * 70)
     print(" RAAE Components Execution Completed Successfully!")
     print("=" * 70)
@@ -98,3 +129,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
