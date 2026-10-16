@@ -51,7 +51,11 @@ class DatabaseManager:
         self.db_path: str = db_path
         self._shared_conn: Optional[sqlite3.Connection] = None
 
-        if db_path != ":memory:":
+        if db_path == ":memory:":
+            self._shared_conn = sqlite3.connect(":memory:", check_same_thread=False)
+            self._shared_conn.row_factory = sqlite3.Row
+            self._shared_conn.execute("PRAGMA foreign_keys = ON;")
+        else:
             db_dir = os.path.dirname(os.path.abspath(db_path))
             if db_dir:
                 os.makedirs(db_dir, exist_ok=True)

@@ -18,12 +18,16 @@ Older names (``save``, ``get_by_id``, ``log_event``, ...) are kept as thin
 aliases so existing backend callers keep working.
 """
 
+import logging
+import time
 import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from backend.models.app import App, AppState, AppStatus
 from backend.models.resource import Resource, ResourceStatus
+
+logger = logging.getLogger(__name__)
 
 
 def _encode_csv(values: Sequence[str]) -> str:
@@ -708,18 +712,27 @@ class EvictionLogRepository(BaseRepository):
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """
         ts = timestamp if timestamp is not None else time.time()
-        return self._execute(
-            sql,
-            (
-                str(app_id),
-                str(algorithm),
-                str(reason),
-                _bool_to_int(lock_checked),
-                _bool_to_int(safe_release),
-                str(result),
-                float(ts),
-            ),
-        ).lastrowid
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.execute(
+                    sql,
+                    (
+                        str(app_id),
+                        str(algorithm),
+                        str(reason),
+                        1 if lock_checked else 0,
+                        1 if safe_release else 0,
+                        str(result),
+                        float(ts)
+                    )
+                )
+                return cursor.lastrowid
+        except sqlite3.Error:
+            logger.exception(
+                "Unable to persist eviction log for app %s.",
+                app_id,
+            )
+            raise
 
     def get_evictions_by_app(self, app_id: str) -> List[Dict[str, Any]]:
         """Retrieves eviction records for an app, newest first."""
@@ -898,6 +911,12 @@ class SystemEventRepository(BaseRepository):
         """
         return self._execute_many_read(sql, (int(limit),))
 
+    def count_evictions(self) -> int:
+        """Returns the total number of recorded eviction decisions."""
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT COUNT(*) AS total FROM EvictionLog").fetchone()
+        return int(row["total"])
+
 
 class ConflictLogRepository(BaseRepository):
     """Repository for ConflictLog persistence."""
@@ -967,25 +986,12 @@ class ConflictLogRepository(BaseRepository):
     def get_all_conflicts(self, limit: int = 100) -> List[Dict[str, Any]]:
         """Retrieves the most recent conflicts, newest first."""
         sql = "SELECT * FROM ConflictLog ORDER BY timestamp DESC LIMIT ?"
-        return self._execute_many_read(sql, (int(limit),))
+        with self._get_connection() as conn:
+            rows = conn.execute(sql, (int(limit),)).fetchall()
+        return [dict(row) for row in rows]
 
-    def log_conflict(
-        self,
-        waiting_app_id: str,
-        blocking_app_id: str,
-        resource_id: str,
-        resolution_strategy: str = "WOUND_WAIT",
-        resolved_by: Optional[str] = None,
-        details: Optional[str] = None,
-        timestamp: Optional[float] = None,
-    ) -> int:
-        """Alias for insert_conflict_log."""
-        return self.insert_conflict_log(
-            waiting_app_id,
-            blocking_app_id,
-            resource_id,
-            resolution_strategy,
-            resolved_by,
-            details,
-            timestamp,
-        )
+    def count_conflicts(self) -> int:
+        """Returns the total number of recorded resource conflicts."""
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT COUNT(*) AS total FROM ConflictLog").fetchone()
+        return int(row["total"])

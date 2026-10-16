@@ -137,143 +137,142 @@ class TestRAAEEngine(unittest.TestCase):
         self.assertEqual(result.decision_type, EvictionDecisionType.CONFLICT)
         self.assertEqual(logs[-1]["action"], "selected_for_eviction")
 
-    def test_safe_eviction_candidate_with_no_resources(self):
-        app = App(app_id="app_no_res", name="Notes", memory_footprint=200, reference_bit=0)
-        self.memory_manager.register_app(app)
+    def _create_camera_simulation(self, app_a_priority, app_b_priority, app_a_time, app_b_time):
+        db = DatabaseManager(":memory:")
+        self.addCleanup(db.close)
 
-        result = self.engine.execute_safe_eviction(app)
+        memory_manager = MemoryManager(total_memory=1000)
+        resource_manager = ResourceManager()
+        camera = Resource("Camera", "Camera", capacity=1)
+        resource_manager.register_resource(camera)
 
-        self.assertEqual(result.decision_type, EvictionDecisionType.ALLOW_EVICTION)
-        self.assertTrue(result.eviction_performed)
-        self.assertTrue(app.is_evicted)
-        self.assertEqual(app.memory_footprint, 0)
-        self.assertEqual(result.memory_released, 200)
-        self.assertEqual(result.released_resource_ids, ())
-        self.assertEqual(result.eviction_event.result, "EVICTED")
+        app_a = App(app_id="app_a", name="App A", priority=app_a_priority)
+        app_b = App(app_id="app_b", name="App B", priority=app_b_priority)
+        memory_manager.register_app(app_a)
+        memory_manager.register_app(app_b)
 
-    def test_safe_eviction_candidate_holding_one_resource(self):
-        app = App(app_id="app_one_res", name="Maps", memory_footprint=250, reference_bit=0)
-        self.memory_manager.register_app(app)
-        self.resource_manager.acquire_resource(app, "GPS")
+        self.assertTrue(resource_manager.acquire_resource(app_a, "Camera"))
+        self.assertFalse(resource_manager.acquire_resource(app_b, "Camera"))
 
-        result = self.engine.execute_safe_eviction(app)
+        app_a.last_access_time = app_a_time
+        app_b.last_access_time = app_b_time
+        db.save_app(app_a)
+        db.save_app(app_b)
+        db.save_resource(camera)
 
-        self.assertEqual(result.decision_type, EvictionDecisionType.RELEASE_THEN_EVICT)
-        self.assertTrue(result.eviction_performed)
-        self.assertTrue(app.is_evicted)
-        self.assertEqual(app.held_resources, set())
-        self.assertEqual(result.released_resource_ids, ("GPS",))
-        self.assertEqual(result.memory_released, 250)
-
-    def test_safe_eviction_candidate_holding_multiple_resources(self):
-        app = App(app_id="app_multi_res", name="Camera", memory_footprint=350, reference_bit=0)
-        self.memory_manager.register_app(app)
-        self.resource_manager.acquire_resource(app, "GPS")
-        self.resource_manager.acquire_resource(app, "MIC")
-
-        result = self.engine.execute_safe_eviction(app)
-
-        self.assertEqual(result.decision_type, EvictionDecisionType.RELEASE_THEN_EVICT)
-        self.assertTrue(result.eviction_performed)
-        self.assertTrue(app.is_evicted)
-        self.assertEqual(app.held_resources, set())
-        self.assertEqual(set(result.released_resource_ids), {"GPS", "MIC"})
-        self.assertEqual(result.memory_released, 350)
-
-    def test_safe_eviction_waiting_candidate_is_not_evicted(self):
-        app = App(app_id="app_waiting", name="Maps", memory_footprint=150, reference_bit=0)
-        app.acquire_resource("GPS")
-        self.memory_manager.register_app(app)
-        manager = FixedConflictManager(
-            ConflictDecision.wait("Conflict Manager requested wait."),
-            held_resources=[Resource("GPS", "GPS Location Sensor")]
+        conflict_manager = ResourceConflictManager(
+            resource_manager,
+            registered_apps=memory_manager.apps,
+            db=db,
         )
-        engine = RAAEEngine(
-            manager,
-            memory_manager=self.memory_manager,
-            resource_manager=self.resource_manager
+        engine = RAAEEngine(conflict_manager)
+        return db, memory_manager, resource_manager, app_a, app_b, engine
+
+    def test_older_waiting_candidate_wounds_younger_camera_holder(self):
+        db, _, resource_manager, app_a, app_b, engine = self._create_camera_simulation(
+            app_a_priority=2,
+            app_b_priority=2,
+            app_a_time=200.0,
+            app_b_time=100.0,
         )
 
-        result = engine.execute_safe_eviction(app)
+        result = engine.evaluate_eviction_candidate(app_b)
+
+        self.assertEqual(result.decision_type, EvictionDecisionType.SAFE_TO_EVICT)
+        self.assertTrue(result.can_evict)
+        self.assertNotIn("Camera", app_a.held_resources)
+        self.assertNotIn("Camera", app_b.held_resources)
+        self.assertNotIn("app_b", resource_manager.get_resource("Camera").waiting_queue)
+        conflicts = db.conflict_log.get_conflicts_by_resource("Camera")
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["waiting_app_id"], "app_b")
+        self.assertEqual(conflicts[0]["blocking_app_id"], "app_a")
+        self.assertEqual(conflicts[0]["resolved_by"], "WOUND")
+
+    def test_younger_waiting_candidate_waits_for_older_camera_holder(self):
+        _, _, resource_manager, app_a, app_b, engine = self._create_camera_simulation(
+            app_a_priority=2,
+            app_b_priority=2,
+            app_a_time=100.0,
+            app_b_time=200.0,
+        )
+
+        result = engine.evaluate_eviction_candidate(app_b)
 
         self.assertEqual(result.decision_type, EvictionDecisionType.WAIT)
-        self.assertFalse(result.eviction_performed)
-        self.assertFalse(app.is_evicted)
-        self.assertEqual(app.memory_footprint, 150)
-        self.assertEqual(app.held_resources, {"GPS"})
-        self.assertEqual(result.eviction_event.result, "WAIT")
+        self.assertFalse(result.can_evict)
+        self.assertIn("Camera", app_a.held_resources)
+        self.assertIn("app_b", resource_manager.get_resource("Camera").waiting_queue)
 
-    def test_waiting_candidate_persistence_does_not_release_locks(self):
-        db = DatabaseManager(db_path=":memory:")
-        try:
-            app = App(app_id="app_waiting_persist", name="Maps", memory_footprint=150, reference_bit=0)
-            app.acquire_resource("GPS")
-            self.memory_manager.register_app(app)
-            db.save_app(app)
-            for resource in self.resource_manager.get_all_resources():
-                db.save_resource(resource)
-            db.resource_locks.acquire_lock(app.app_id, "GPS", units=1)
+    def test_equal_priority_and_timestamp_waits_deterministically(self):
+        _, _, resource_manager, app_a, app_b, engine = self._create_camera_simulation(
+            app_a_priority=3,
+            app_b_priority=3,
+            app_a_time=150.0,
+            app_b_time=150.0,
+        )
 
-            manager = FixedConflictManager(
-                ConflictDecision.wait("Conflict Manager requested wait."),
-                held_resources=[Resource("GPS", "GPS Location Sensor")]
-            )
-            engine = RAAEEngine(
-                manager,
-                memory_manager=self.memory_manager,
-                resource_manager=self.resource_manager,
-                persistence=DatabaseEvictionPersistence(db)
-            )
+        first = engine.evaluate_eviction_candidate(app_b)
+        second = engine.evaluate_eviction_candidate(app_b)
 
-            result = engine.execute_safe_eviction(app)
-            active_locks = db.resource_locks.get_active_locks()
-            eviction_logs = db.eviction_log.get_evictions_by_app(app.app_id)
+        self.assertEqual(first.decision_type, EvictionDecisionType.WAIT)
+        self.assertEqual(second.decision_type, EvictionDecisionType.WAIT)
+        self.assertEqual(first.conflict_decision.reason, second.conflict_decision.reason)
+        self.assertIn("Camera", app_a.held_resources)
+        self.assertIn("app_b", resource_manager.get_resource("Camera").waiting_queue)
 
-            self.assertEqual(result.decision_type, EvictionDecisionType.WAIT)
-            self.assertFalse(result.eviction_performed)
-            self.assertTrue(any(lock["app_id"] == app.app_id for lock in active_locks))
-            self.assertEqual(eviction_logs[0]["result"], "WAIT")
-        finally:
-            db.close()
+    def test_wound_releases_all_holder_units_before_safe_result(self):
+        db = DatabaseManager(":memory:")
+        self.addCleanup(db.close)
+        memory_manager = MemoryManager(total_memory=1000)
+        resource_manager = ResourceManager()
+        camera = Resource("Camera", "Camera", capacity=3)
+        resource_manager.register_resource(camera)
 
-    def test_successfully_evicted_candidate_is_persisted_atomically(self):
-        db = DatabaseManager(db_path=":memory:")
-        try:
-            app = App(app_id="app_persist", name="Maps", memory_footprint=300, reference_bit=0)
-            self.memory_manager.register_app(app)
-            db.save_app(app)
-            for resource in self.resource_manager.get_all_resources():
-                db.save_resource(resource)
+        app_a = App(app_id="app_a", name="App A", priority=1)
+        app_b = App(app_id="app_b", name="App B", priority=5)
+        memory_manager.register_app(app_a)
+        memory_manager.register_app(app_b)
+        self.assertTrue(resource_manager.acquire_resource(app_a, "Camera", units=2))
+        self.assertFalse(resource_manager.acquire_resource(app_b, "Camera", units=2))
+        app_a.last_access_time = 200.0
+        app_b.last_access_time = 100.0
+        db.save_app(app_a)
+        db.save_app(app_b)
+        db.save_resource(camera)
 
-            self.resource_manager.acquire_resource(app, "GPS")
-            db.save_app(app)
-            db.resource_locks.acquire_lock(app.app_id, "GPS", units=1)
+        engine = RAAEEngine(ResourceConflictManager(
+            resource_manager,
+            registered_apps=memory_manager.apps,
+            db=db,
+        ))
 
-            engine = RAAEEngine(
-                self.conflict_manager,
-                memory_manager=self.memory_manager,
-                resource_manager=self.resource_manager,
-                persistence=DatabaseEvictionPersistence(db)
-            )
+        result = engine.evaluate_eviction_candidate(app_b)
 
-            result = engine.execute_safe_eviction(app)
+        self.assertEqual(result.decision_type, EvictionDecisionType.SAFE_TO_EVICT)
+        self.assertNotIn("app_a", camera.holders)
+        self.assertNotIn("app_b", camera.holders)
+        self.assertNotIn("app_b", camera.waiting_queue)
+        self.assertEqual(camera.available_units, camera.capacity)
+        self.assertEqual(db.conflict_log.get_conflicts_by_resource("Camera")[0]["resolved_by"], "WOUND")
 
-            persisted_app = db.get_app(app.app_id)
-            eviction_logs = db.eviction_log.get_evictions_by_app(app.app_id)
-            memory_events = db.memory_events.get_events_by_app(app.app_id)
-            active_locks = db.resource_locks.get_active_locks()
+    def test_conflict_resolution_runs_ten_clock_ticks(self):
+        _, memory_manager, _, _, _, engine = self._create_camera_simulation(
+            app_a_priority=1,
+            app_b_priority=5,
+            app_a_time=200.0,
+            app_b_time=100.0,
+        )
 
-            self.assertTrue(result.eviction_performed)
-            self.assertGreater(result.persisted_event_id, 0)
-            self.assertEqual(persisted_app.state, AppState.EVICTED)
-            self.assertEqual(persisted_app.memory_footprint, 0)
-            self.assertEqual(persisted_app.held_resources, set())
-            self.assertEqual(eviction_logs[0]["result"], "EVICTED")
-            self.assertEqual(eviction_logs[0]["safe_release"], 1)
-            self.assertEqual(memory_events[0]["action"], "EVICT")
-            self.assertFalse(any(lock["app_id"] == app.app_id for lock in active_locks))
-        finally:
-            db.close()
+        results = []
+        for _ in range(10):
+            result, logs = memory_manager.evaluate_clock_candidate_with_raae(engine)
+            self.assertIsNotNone(result)
+            self.assertTrue(logs)
+            results.append(result)
+
+        self.assertEqual(len(results), 10)
+        self.assertTrue(all(result.candidate.is_active for result in results))
 
 
 if __name__ == "__main__":

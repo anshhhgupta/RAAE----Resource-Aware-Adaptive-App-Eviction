@@ -2,6 +2,7 @@
 
 import unittest
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from backend.models.app import App, AppState, AppStatus
 from backend.models.resource import Resource, ResourceStatus
 from database.db import DatabaseManager
@@ -68,6 +69,15 @@ class TestDatabaseManager(unittest.TestCase):
                 "INSERT INTO ResourceLocks (app_id, resource_id, units, status, acquired_at) VALUES (?, ?, ?, ?, ?)",
                 ("non_existent_app", "GPS", 1, "HELD", 12345.0)
             )
+
+    def test_in_memory_database_can_be_read_from_another_script_thread(self):
+        app = App(app_id="app_threaded", name="Streamlit App")
+        self.db.save_app(app)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            apps = executor.submit(self.db.get_all_apps).result()
+
+        self.assertTrue(any(item.app_id == app.app_id for item in apps))
 
     def test_save_and_get_app(self):
         """Test persisting an App instance to SQLite and retrieving it."""
@@ -207,6 +217,7 @@ class TestDatabaseManager(unittest.TestCase):
         self.assertEqual(logs[0]["algorithm"], "RAAE_CLOCK")
         self.assertEqual(logs[0]["lock_checked"], 1)
         self.assertEqual(logs[0]["result"], "EVICTED")
+        self.assertEqual(self.db.eviction_log.count_evictions(), 1)
 
     def test_conflict_log_repository(self):
         """Test logging resource conflicts and resolution."""
@@ -229,6 +240,7 @@ class TestDatabaseManager(unittest.TestCase):
         self.assertEqual(len(conflicts), 1)
         self.assertEqual(conflicts[0]["waiting_app_id"], "app_conf_2")
         self.assertEqual(conflicts[0]["blocking_app_id"], "app_conf_1")
+        self.assertEqual(self.db.conflict_log.count_conflicts(), 1)
 
     def test_connection_is_usable_from_another_thread(self):
         """A manager kept in session state must survive a rerun on a new thread.

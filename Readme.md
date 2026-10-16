@@ -2,6 +2,96 @@
 
 > A resource-aware operating system simulation that prevents unsafe application eviction by coordinating memory management with shared resource locks.
 
+## Phase-II Quick Start
+
+RAAE is a Python/Streamlit simulation that combines Clock (second-chance)
+candidate selection with resource checks and Wound-Wait conflict decisions.
+The dashboard displays live app and resource state, RAM metrics, simulation
+events, SQLite eviction/conflict logs, and an isolated Clock-vs-RAAE evaluation.
+It does not implement operating-system process control or claim real device
+access or real application freezes.
+
+### Architecture
+
+```text
+Streamlit dashboard (app.py)
+          │
+          ▼
+SimulationController ───── SQLite repositories
+    │          │
+    │          └── ResourceManager / semaphore queues
+    ├── MemoryManager / Clock candidate selection
+    ├── RAAEEngine
+    │       └── ResourceConflictManager ── Wound-Wait ConflictManager
+    └── WorkloadGenerator
+
+Policy evaluator: independent cloned snapshots for Clock vs RAAE charts
+```
+
+### Module responsibilities
+
+| Module | Responsibility |
+| --- | --- |
+| `app.py` | Streamlit controls, app/resource tables, RAM metrics, event log, and comparison charts |
+| `backend/simulation_controller.py` | Connects simulation managers, database operations, UI actions, and event queries |
+| `backend/models/app.py`, `backend/models/resource.py` | App, resource, state, and status data models |
+| `backend/memory_manager/memory_manager.py` | RAM accounting, pressure levels, Clock hand, candidate selection, and eviction state |
+| `backend/resource_manager/resource_manager.py`, `backend/resource_manager/semaphore.py` | Resource registration, acquisition/release, holders, and FIFO wait queues |
+| `backend/raae_engine/raae_engine.py`, `backend/raae_engine/conflict_manager.py` | Candidate resource checks and translation of conflict outcomes into eviction decisions |
+| `backend/conflict_manager/conflict_manager.py` | Wound-Wait decisions based on priority, then timestamp |
+| `backend/workload_generator/workload_generator.py` | Sample app templates, random events, and memory-pressure allocation |
+| `backend/policy_evaluation.py` | Fair fixed-snapshot Clock-vs-RAAE trial on independent state clones |
+| `backend/phase2_resources.py` | Idempotently registers the Camera, Microphone, GPS, and Audio IDs used by the dashboard demo |
+| `database/schema.sql`, `database/db.py`, `database/repositories.py` | SQLite schema, database lifecycle, and persistence queries |
+| `tests/` | Model, manager, database, controller, engine, and policy-evaluation tests |
+
+### Setup and run
+
+Use Python 3.10 or later. From the repository root, create and activate a
+virtual environment and install the dashboard dependencies:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+Start the dashboard with this command from the activated environment:
+
+```powershell
+python -m streamlit run app.py
+```
+
+Open the local URL printed by Streamlit. `demo.py` is a separate command-line
+component demonstration; the full Phase-II workflow runs in the dashboard.
+
+### Phase-II demonstration steps
+
+1. In **Add Application**, create a low-priority background app (for example,
+   priority 1 and 250 MB) and a higher-priority app (for example, priority 10
+   and 200 MB). Priority, initial state, and memory are configurable at creation.
+2. In **Resource Operations**, choose the first app and request **Camera**.
+   Choose the second app and request **Camera** too; it should appear as a
+   waiter. The same controls expose **Microphone**, **GPS**, and **Audio**.
+3. Check the application/resource tables and RAM cards. Trigger memory pressure
+   from the sidebar to allocate memory toward the selected percentage.
+4. Press **Start**, then **Clock Tick**. The event log identifies the selected
+   Clock candidate and RAAE decision. With a higher-priority waiter, Wound-Wait
+   can wound the lower-priority holder, safely release the resource, wake the
+   waiter, and allow the candidate eviction.
+5. Confirm the resource holder/queue state and inspect the dashboard event log.
+   Expand the SQLite **Conflict Log** and **Eviction Log** to verify recorded
+   outcomes. Release any remaining resource using **Release Resource**.
+6. Run **Clock vs RAAE Evaluation** and inspect its metrics and three charts.
+   Both policies start from independent copies of the same current snapshot;
+   this is a fixed-snapshot eviction-attempt comparison, not a replay of
+   recorded operations.
+
+The controller currently uses SQLite `:memory:` storage for each Streamlit
+session. Database log entries are available during that session but do not
+survive a process restart. The dashboard event table is a bounded in-memory
+simulation event log.
+
 ---
 
 ## 📌 Overview
@@ -90,19 +180,15 @@ Does the App Hold a Resource?
 Users can:
 
 * Create simulated applications
-* Start and stop applications
-* Move applications between foreground and background
-* Assign application priorities
-* Allocate memory
-* Monitor application states
-* View active resources
+* Configure priority, initial foreground/background state, and initial memory
+* View application state, memory usage, reference bit, and held resources
 
 Example application:
 
 ```text
 App Name: Maps
-Priority: High
-Memory Used: 250 MB
+Priority: 3
+Memory: 250 MB
 State: Background
 Resource Held: GPS
 ```
@@ -115,19 +201,16 @@ The system simulates limited system memory.
 
 Features:
 
-* Memory allocation
-* Memory deallocation
-* Memory pressure detection
-* Used memory calculation
-* Free memory calculation
-* Eviction triggering
-* Memory pressure levels
+* Live used/free RAM and pressure-level metrics
+* Configurable memory-pressure trigger
+* Clock/Second-Chance candidate selection on each manual tick
+* Eviction after the RAAE safety decision
 
 ```text
-GREEN   → Low memory usage
-YELLOW  → Moderate memory usage
-ORANGE  → High memory usage
-RED     → Critical memory pressure
+GREEN   → below 60%
+YELLOW  → 60% to below 75%
+ORANGE  → 75% to below 90%
+RED     → 90% or above
 ```
 
 ---
@@ -160,6 +243,7 @@ That application becomes an eviction candidate.
 RAAE can simulate multiple shared resources:
 
 * 🎤 Microphone
+* 📷 Camera
 * 📍 GPS
 * 🔊 Audio Output
 * 📁 File Locks
@@ -196,7 +280,7 @@ When multiple applications request the same resource, RAAE analyzes:
 * Application priority
 * Current resource holder
 * Waiting applications
-* Request order
+* Last-access timestamp as a tie-breaker
 
 The system can use the **Wound-Wait algorithm** to resolve conflicts.
 
@@ -268,69 +352,48 @@ Displays:
 * Background applications
 * Active locks
 * Waiting applications
-* Freeze incidents
+* Simulated wait/freeze proxy (RAAE `WAIT` decisions; not a real freeze)
 
----
-
-## 📱 App Manager
-
-Users can:
-
-* Create an app
-* Start an app
-* Stop an app
-* Change app priority
-* Allocate memory
-* Move app to background
-* View app details
-
----
-
-## 🧠 Memory Manager
-
-Users can:
-
-* Allocate memory
-* Release memory
-* Trigger memory pressure
-* View memory usage
-* View Clock pointer
-* View reference bits
-* Run the Clock algorithm
-
----
-
-## 🔒 Resource Manager
-
-Users can:
-
-* Request resources
-* Release resources
-* View resource ownership
-* View waiting queues
-* Simulate resource conflicts
+The Streamlit dashboard also provides a **Clock vs RAAE Evaluation** section. It
+runs both policies on independent copies of the current app/resource snapshot,
+using the same eviction-attempt limit and preserving the live simulation state.
+This is a fixed-snapshot eviction-attempt comparison, not a replay of recorded
+resource requests or other workload operations. The evaluation reports
+successful evictions, Wound-Wait outcomes written to its isolated conflict log,
+and passive holder/waiter contention observations separately. The latter are
+not conflict-manager decisions. Its simulated wait/freeze proxy counts RAAE
+`WAIT` decisions; it does not establish an actual or operating-system freeze.
+Resource-blocked evictions count only non-eviction decisions in
+`WAIT`, `RESOLVE_REQUIRED`, `BLOCKED`, or `NOT_SAFE` that identify at least one
+resource. Latency is average RAAE engine orchestration time for conflict cases,
+not isolated conflict-resolver execution time; it is unavailable when no
+conflict case is measured. Plain Clock has no conflict resolver. Install the
+dashboard dependencies with `pip install -r requirements.txt`.
 
 ---
 
 ## ⚙️ Simulation Control
 
-Users can:
-
 ```text
 ▶ Start Simulation
-⏸ Pause
-⏭ Next Step
-🔄 Reset
-⚡ Generate Memory Pressure
+⏹ Stop
+↺ Reset
+⏱ Clock Tick
+🎲 Random Event
 ```
 
-The simulation can run step-by-step.
+The simulation advances explicitly through **Clock Tick**; the dashboard also
+provides **Refresh view** without advancing simulation state.
 
 ---
 
 ## 🤖 RAAE Decision Engine
 
-Displays the complete eviction decision:
+The event log displays the selected Clock candidate, RAAE status/reason, and
+related resource identifiers. RAAE checks held/waiting resources, delegates
+contention to Wound-Wait, and proceeds with eviction only after the safe
+decision. A successful decision may release the candidate's resource and wake
+the next queued app before evicting the candidate.
 
 ```text
 Eviction Candidate
@@ -348,17 +411,11 @@ Final Eviction
 
 ---
 
-## 📊 Analytics
+## 📊 Dashboard data
 
-The system can display:
-
-* Total evictions
-* Freeze incidents
-* Resource conflicts
-* Average conflict resolution time
-* Memory usage history
-* Most conflicted resources
-* Most frequently evicted applications
+The dashboard shows live RAM/app/resource state, a bounded simulation event
+log, and SQLite-backed conflict and eviction log expanders. It does not provide
+historical memory charts or advanced risk scoring.
 
 ---
 
@@ -367,313 +424,34 @@ The system can display:
 | Algorithm               | Purpose                        |
 | ----------------------- | ------------------------------ |
 | Clock / Second-Chance   | Select eviction candidate      |
-| Wound-Wait              | Resolve resource conflicts     |
-| DFS Cycle Detection     | Detect deadlocks               |
-| Wait-For Graph          | Represent process dependencies |
-| Adaptive Eviction Score | Improve eviction decisions     |
-| Historical Analysis     | Analyze previous system events |
+| Wound-Wait              | Choose whether to wound a holder or wait, based on priority and timestamp |
 
 ---
 
 # 🗄️ Database Design
 
-The project uses **SQLite** for storing simulation events and historical data. All SQL lives in the `database` package; see `database/schema.sql` for the authoritative definition.
-
-## Entity Relationships
-
-```text
-              (1)             (*)             (1)
- Apps ───────────────── ResourceLocks ───────────────── Resources
-  │                                                ▲          │
-  │ (1)                                             │ (1)      │ (1)
-  │                                                └──────────┘
-  │ (*)
-  ├── MemoryEvents   allocation / deallocation / pressure samples
-  ├── EvictionLog    eviction decisions and outcomes
-  ├── ConflictLog    two refs per row: waiting_app_id, blocking_app_id
-  │                  plus a third reference to Resources.resource_id
-  └── LockRequests   every lock attempt, including blocked ones
-
- Resources.held_by_app_id  ──► Apps.app_id          (ON DELETE SET NULL)
- ResourceLocks.app_id      ──► Apps.app_id          (ON DELETE CASCADE)
- ResourceLocks.resource_id ──► Resources.resource_id (ON DELETE CASCADE)
- LockRequests.app_id       ──► Apps.app_id          (ON DELETE CASCADE)
- LockRequests.resource_id  ──► Resources.resource_id (ON DELETE CASCADE)
-
- SystemEvents   no foreign key — memory pressure is machine-scoped
-```
-
-The schema is normalized to third normal form — every fact is stored in exactly one table. `ConflictLog` points at `Apps` twice rather than duplicating app data, and `LockRequests` stays separate from `ResourceLocks` because ownership intervals and request attempts are different facts: a blocked request leaves a `LockRequests` row but never owns a lock.
-
-## Persisted Events
-
-| Event                     | Stored in                                             |
-| ------------------------- | ----------------------------------------------------- |
-| App creation              | `Apps`                                                |
-| Memory allocation         | `MemoryEvents` (`ALLOCATE`)                           |
-| Memory pressure           | `SystemEvents`                                        |
-| Resource acquisition      | `ResourceLocks` + `LockRequests` (`GRANTED`)          |
-| Resource request blocked  | `LockRequests` (`QUEUED`)                             |
-| Resource release          | `ResourceLocks` (`RELEASED`) + `LockRequests` (`RELEASED`) |
-| Eviction attempt          | `EvictionLog` (`EVICTED` / `CONFLICT` / `WAIT`)       |
-| Successful eviction       | `EvictionLog` (`EVICTED`) + `MemoryEvents` (`EVICT`)  |
-| Blocked / waiting eviction| `EvictionLog` (`CONFLICT` / `WAIT`) + `MemoryEvents` (`EVICT_ATTEMPT`) |
-| Wound-Wait conflict       | `ConflictLog` (`WOUND_WAIT`)                          |
-| Freeze incident           | `ConflictLog` (`NONE`, details prefixed `FREEZE`)     |
-
-## Apps
-
-```text
-Apps
----------------------------
-app_id              (PK)
-name
-priority
-state
-memory_footprint
-reference_bit
-last_access_time
-held_resources
-status
-```
-
----
-
-## Resources
-
-```text
-Resources
----------------------------
-resource_id          (PK)
-name
-capacity
-available_units     -- derived from ResourceLocks
-status              -- derived from ResourceLocks
-held_by_app_id      (FK -> Apps.app_id) -- derived from ResourceLocks
-waiting_queue
-```
-
----
-
-## ResourceLocks
-
-The authoritative ledger of lock ownership. `HELD` rows describe current ownership; `RELEASED` rows are kept as history.
-
-```text
-ResourceLocks
----------------------------
-lock_id              (PK, autoincrement)
-app_id               (FK -> Apps.app_id)
-resource_id          (FK -> Resources.resource_id)
-units
-status               HELD | RELEASED
-acquired_at
-released_at
-```
-
-**Consistency rules**
-
-| Rule                                                    | Mechanism                                                |
-| ------------------------------------------------------- | -------------------------------------------------------- |
-| Locks reference existing apps and resources             | Foreign keys                                            |
-| A lock covers at least one unit                          | `CHECK (units > 0)`                                     |
-| Status is `HELD` or `RELEASED`                           | `CHECK`                                                  |
-| A `RELEASED` row records when it was released            | `CHECK`                                                  |
-| One live lock per `(app_id, resource_id)`                | Partial unique index `ux_resourcelocks_held_app_resource` |
-| Deleting an app or resource clears dependent rows        | `ON DELETE CASCADE`                                      |
-
-`available_units`, `held_by_app_id` and `status` on `Resources` duplicate the ledger for fast reads, so SQLite triggers re-derive them on every lock insert, update and delete:
-
-```sql
-available_units = max(capacity - SUM(units) over HELD locks, 0)
-held_by_app_id  = app_id of the earliest HELD lock, NULL when none
-status          = WAITING if waiting_queue is non-empty, else LOCKED / FREE
-```
-
-**Decision boundary:** Python decides *whether* a lock can be acquired (`SemaphoreLock` / `ResourceManager` / the RAAE engine). SQLite only records that decision and keeps the derived resource state consistent — no trigger grants, queues or refuses an acquisition.
-
----
-
-## MemoryEvents
-
-```text
-MemoryEvents
----------------------------
-event_id
-app_id
-action
-memory_before
-memory_after
-pressure_level
-timestamp
-```
-
----
-
-## EvictionLog
-
-```text
-EvictionLog
----------------------------
-event_id
-app_id
-algorithm
-reason
-lock_checked
-safe_release
-result
-timestamp
-```
-
----
-
-## ConflictLog
-
-```text
-ConflictLog
----------------------------
-conflict_id
-waiting_app_id          (FK -> Apps.app_id)
-blocking_app_id         (FK -> Apps.app_id)
-resource_id             (FK -> Resources.resource_id)
-resolution_strategy
-timestamp
-resolved_by
-details
-```
-
----
-
-## LockRequests
-
-Every lock attempt and the answer it received. A blocked request has a row here even though no lock is ever held.
-
-```text
-LockRequests
----------------------------
-request_id
-app_id               (FK -> Apps.app_id)
-resource_id          (FK -> Resources.resource_id)
-outcome              GRANTED | QUEUED | RELEASED
-requested_at
-```
-
----
-
-## SystemEvents
-
-Machine-scoped telemetry. Memory pressure is a property of the whole system, so it is deliberately not stored against an `app_id`.
-
-```text
-SystemEvents
----------------------------
-event_id
-event_type                (MEMORY_PRESSURE)
-pressure_level            GREEN | YELLOW | ORANGE | RED
-used_memory
-total_memory
-timestamp
-```
-
----
-
-## Analytics (`db.analytics`)
-
-`database/analytics.py` holds the read-only aggregations behind the Phase-II dashboards. Every function returns a plain Python structure — an `int`, a `float`/`None`, or a `list` of `dict` with stable keys — so results drop straight into Streamlit widgets or Matplotlib series with no adapter. No `sqlite3.Row`, cursor or model object is ever returned. Nothing here writes.
-
-| Call | Returns |
-|---|---|
-| `total_eviction_count(result="EVICTED")` | `int`. Pass `result=None` to count every decision, including the `WAIT`/`CONFLICT` blocks. |
-| `total_evictions_by_result()` | `dict` of `result` → count, for an outcome-split bar chart. |
-| `total_freeze_incidents()` | `int` stranded waiters. |
-| `total_conflicts(freeze_only=False)` | `int` conflict incidents. |
-| `successful_resource_acquisitions()` | `int` granted lock requests. |
-| `resource_releases()` | `int` released lock requests. |
-| `queued_resource_requests()` | `int` blocked attempts, which hold no lock but still contended. |
-| `evictions_by_app(result="EVICTED", limit=None)` | `list[dict]`: `app_id`, `app_name`, `evictions`, `attempts`, `blocked`, `memory_freed_mb`. |
-| `evictions_by_resource(limit=None)` | `list[dict]`: `resource_id`, `resource_name`, `evictions`, `apps_evicted`. |
-| `conflicts_by_resource(limit=None)` | `list[dict]`: `resource_id`, `resource_name`, `conflicts`, `freezes`. |
-| `events_over_time(bucket_seconds=60, start=None, end=None)` | `list[dict]` timeline: `bucket_start`, `bucket_end`, plus `evictions`, `blocked_evictions`, `conflicts`, `freezes`, `grants`, `releases`, `memory_events`. |
-| `average_conflict_resolution_latency()` | `float` seconds, or `None` when no waiter was ever served. |
-| `conflict_resolution_samples(limit=None)` | `list[dict]` of the individual `queued_at` / `granted_at` / `latency_seconds` waits behind that average. |
-| `policy_comparison()` | `list[dict]` per algorithm: `algorithm`, `policy`, `evictions`, `attempts`, `blocked_evictions`, `safe_releases`, `evictions_without_safe_release`, `freeze_incidents`. |
-| `policy_delta()` | `dict` baseline-minus-RAAE difference, with `available: False` when either policy is missing. |
-| `summary()` | `dict` of every headline counter — one call for a metric row. |
-
-### Definitions worth knowing
-
-- **Freeze** — a conflict whose `details` opens with the `FREEZE` marker written by both freeze paths. The marker, not `resolution_strategy = 'NONE'`, identifies it, so an unrelated unresolved conflict is not miscounted as a stranded waiter.
-- **Latency** — `ConflictLog` stores one timestamp per incident, so it cannot express a duration on its own. The measurable wait is in `LockRequests`: the app was queued at its `QUEUED` request and served by the first `GRANTED` request after it for the same app and resource. Each queued request is charged its own wait. `None` is returned when nothing was ever served — that absence is itself the finding, and it is kept distinct from `0.0`.
-- **Evictions by resource** — `EvictionLog` records which app was considered, not which resource it held. `ResourceLocks` is the only normalized link between an app and the resources it held, so an eviction is attributed to every resource in that app's lock *history*. The figure is "evictions of apps that had held this resource", not "evictions caused by this resource" — the eviction that retires those locks clears the evidence in the same moment.
-- **`memory_freed_mb`** — the `memory_before - memory_after` delta of the app's `EVICT` MemoryEvents. It cannot be read off `Apps`, because eviction zeroes the persisted footprint in the same step that records the eviction.
-- **Policy names** — the active policy is stored as `EvictionLog.algorithm`: baseline writes `BASELINE_CLOCK`, the RAAE engine writes `RAAE_CLOCK`. Both are mapped to their policy name (`policy_comparison` and `policy_delta` only) so callers need not know the engine suffixes its own algorithm string.
-
-### Index use
-
-Every query filters or groups on an indexed column. Two indexes exist specifically for these aggregations: `idx_evictionlog_result_app` puts `result` first so both a `COUNT` and a `GROUP BY app_id` are served from one index, and `idx_conflictlog_freeze` is a partial index holding only freeze rows. The freeze predicate is written as a literal rather than a bind parameter because SQLite can only match a partial index when the query repeats the index predicate literally — binding it would silently downgrade the count to a full table scan. `tests/test_analytics.py` asserts the query plans for both, including a test that pins down why the parameter form fails.
-
----
-
-## Persistence Integration
-
-`backend/persistence_bridge.py` connects the simulation modules to the repositories. It exists to resolve two hooks the managers already called that matched no repository — `SemaphoreLock`'s `log_lock_request` and `MemoryManager.get_pressure_level`'s `log_memory_pressure` — without rewriting either module.
-
-It also enforces one rule for an OS simulator: **a database failure may cost history, but must never corrupt in-memory simulation state.** The managers mutate their objects before persisting, so an exception escaping a write would abort the simulation halfway through a change it had already made. The bridge routes every write — direct, through a forwarded repository, or inside a transaction — through a guard that records the failure and returns `None`. An error raised by the simulation's own logic still propagates.
-
-```python
-db = DatabaseManager(":memory:")
-bridge = PersistenceBridge(db)
-
-memory = MemoryManager(total_memory=1000, db=bridge)
-resources = ResourceManager(db=bridge)
-resources.create_default_resources()
-
-engine = RAAEEngine(
-    WoundWaitConflictAdapter(WoundWaitConflictManager(db=bridge), resources),
-    memory_manager=memory,
-    resource_manager=resources,
-    persistence=DatabaseEvictionPersistence(bridge),
-)
-```
+`database/schema.sql` defines the SQLite tables `Apps`, `Resources`,
+`ResourceLocks`, `MemoryEvents`, `EvictionLog`, and `ConflictLog`. The current
+controller writes app/resource snapshots plus eviction and Wound-Wait conflict
+records. The Streamlit controller currently opens a per-session `:memory:`
+database; records are visible in the dashboard while that session is alive and
+are not durable across process restarts.
 
 ---
 
 # 🏗️ System Architecture
 
 ```text
-                    ┌───────────────┐
-                    │   Frontend UI │
-                    │   Dashboard   │
-                    └───────┬───────┘
-                            │
-                            ▼
-                  ┌───────────────────┐
-                  │ Simulation Engine │
-                  └─────────┬─────────┘
-                            │
-          ┌─────────────────┼─────────────────┐
-          ▼                 ▼                 ▼
-   Memory Manager    Resource Manager    App Manager
-          │                 │                 │
-          ▼                 ▼                 ▼
-   Clock Algorithm     Lock Manager      App States
-          │                 │
-          └──────────┬──────┘
-                     ▼
-              ┌──────────────┐
-              │ RAAE Engine  │
-              └──────┬───────┘
-                     │
-          ┌──────────┴──────────┐
-          ▼                     ▼
-    Wound-Wait           Deadlock Detection
-          │                     │
-          └──────────┬──────────┘
-                     ▼
-                  SQLite
-                     │
-                     ▼
-            Analytics & History
+Streamlit UI
+    │
+    ▼
+SimulationController ─── SQLite repositories
+    ├── MemoryManager / Clock
+    ├── ResourceManager / SemaphoreLock
+    ├── RAAEEngine ─── ResourceConflictManager ─── WoundWait ConflictManager
+    └── WorkloadGenerator
+
+Policy evaluator ─── cloned snapshot states ─── Clock and RAAE metrics/charts
 ```
 
 ---
@@ -682,27 +460,24 @@ engine = RAAEEngine(
 
 ```text
 RAAE/
-│
-├── frontend/
-│   ├── components/
-│   ├── pages/
-│   └── dashboard/
-│
+├── app.py
 ├── backend/
-│   ├── simulation_engine/
+│   ├── conflict_manager/
 │   ├── memory_manager/
+│   ├── models/
+│   ├── raae_engine/
 │   ├── resource_manager/
-│   ├── raee_engine/
-│   └── algorithms/
-│
+│   ├── workload_generator/
+│   ├── policy_evaluation.py
+│   ├── phase2_resources.py
+│   └── simulation_controller.py
 ├── database/
 │   ├── schema.sql
-│   └── raee.db
-│
-├── logs/
+│   ├── db.py
+│   └── repositories.py
 ├── tests/
-│
-├── README.md
+├── demo.py
+├── Readme.md
 └── requirements.txt
 ```
 
@@ -714,11 +489,10 @@ RAAE/
 | -------------------- | --------------------- |
 | Backend / Simulation | Python                |
 | Database             | SQLite                |
-| Frontend             | React or Streamlit    |
-| Visualization        | Matplotlib / Chart.js |
+| Frontend             | Streamlit             |
+| Visualization        | Matplotlib            |
 | Memory Algorithm     | Clock / Second-Chance |
 | Resource Conflict    | Wound-Wait            |
-| Deadlock Detection   | DFS + Wait-For Graph  |
 
 ---
 
@@ -733,7 +507,7 @@ The project can compare traditional eviction algorithms with RAAE.
 | Lock Check            | ❌                     | ✅    |
 | Conflict Resolution   | ❌                     | ✅    |
 | Safe Resource Release | ❌                     | ✅    |
-| Historical Analysis   | Optional              | ✅    |
+| Snapshot comparison   | ❌                     | ✅    |
 
 ---
 
@@ -788,13 +562,13 @@ This integration allows memory-management decisions to consider active resource 
 
 RAAE aims to:
 
-* Reduce simulated application freezes
+* Compare simulated wait/freeze proxy decisions (not real freezes)
 * Prevent unsafe eviction
 * Safely manage shared resources
 * Resolve application conflicts
 * Compare baseline algorithms with RAAE
-* Store simulation history in SQLite
-* Provide useful analytics through the UI
+* Record in-session eviction/conflict outcomes in SQLite
+* Display current-state metrics and fixed-snapshot comparison charts
 
 ---
 
@@ -885,4 +659,3 @@ Analytics
 ```
 
 The project provides an interactive simulation environment where users can observe how applications compete for limited memory and shared resources. It demonstrates how resource-aware eviction can improve upon traditional eviction strategies by checking dependencies before removing an application.
-
