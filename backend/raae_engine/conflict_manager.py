@@ -317,3 +317,20 @@ class ResourceConflictManager:
                 timestamp=result.resolution_timestamp or result.timestamp,
             )
 
+
+class WoundWaitConflictAdapter(ResourceConflictManager):
+    """Adapts the Wound-Wait manager to the RAAE conflict-manager interface."""
+
+    def __init__(
+        self,
+        conflict_manager: WoundWaitConflictManager,
+        resource_manager: ResourceManager,
+        registered_apps: Optional[Dict[str, App]] = None,
+    ) -> None:
+        super().__init__(
+            resource_manager=resource_manager,
+            registered_apps=registered_apps if registered_apps is not None else resource_manager.apps,
+            db=conflict_manager.db,
+        )
+        self.conflict_manager = conflict_manager
+

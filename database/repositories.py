@@ -764,6 +764,12 @@ class EvictionLogRepository(BaseRepository):
             app_id, algorithm, reason, lock_checked, safe_release, result, timestamp
         )
 
+    def count_evictions(self) -> int:
+        """Returns the total number of recorded eviction decisions."""
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT COUNT(*) AS total FROM EvictionLog").fetchone()
+        return int(row["total"])
+
 
 class LockRequestRepository(BaseRepository):
     """Repository for LockRequests persistence.
@@ -911,12 +917,6 @@ class SystemEventRepository(BaseRepository):
         """
         return self._execute_many_read(sql, (int(limit),))
 
-    def count_evictions(self) -> int:
-        """Returns the total number of recorded eviction decisions."""
-        with self._get_connection() as conn:
-            row = conn.execute("SELECT COUNT(*) AS total FROM EvictionLog").fetchone()
-        return int(row["total"])
-
 
 class ConflictLogRepository(BaseRepository):
     """Repository for ConflictLog persistence."""
@@ -968,6 +968,27 @@ class ConflictLogRepository(BaseRepository):
                 str(details) if details else None,
             ),
         ).lastrowid
+
+    def log_conflict(
+        self,
+        waiting_app_id: str,
+        blocking_app_id: str,
+        resource_id: str,
+        resolution_strategy: str = "WOUND_WAIT",
+        resolved_by: Optional[str] = None,
+        details: Optional[str] = None,
+        timestamp: Optional[float] = None,
+    ) -> int:
+        """Alias for insert_conflict_log."""
+        return self.insert_conflict_log(
+            waiting_app_id,
+            blocking_app_id,
+            resource_id,
+            resolution_strategy,
+            resolved_by,
+            details,
+            timestamp,
+        )
 
     def get_conflicts_by_resource(self, resource_id: str) -> List[Dict[str, Any]]:
         """Retrieves conflicts involving a resource, newest first."""

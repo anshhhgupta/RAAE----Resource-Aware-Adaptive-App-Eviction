@@ -25,6 +25,7 @@ class UnsupportedWorkloadError(ValueError):
 class PolicyMetrics:
     policy: str
     eviction_count: int
+    unresolved_contention_evictions: int
     simulated_wait_freeze_proxy_count: int
     logged_conflict_outcomes: int
     passive_contention_observations: int
@@ -133,6 +134,7 @@ def _run_policy(
 
         logged_conflict_outcomes = 0
         passive_contention_observations = 0
+        unresolved_contention_evictions = 0
         simulated_wait_freeze_proxy_count = 0
         blocked_evictions = 0
         conflict_case_orchestration_latencies = []
@@ -158,7 +160,10 @@ def _run_policy(
                 result = engine.orchestrate_safe_eviction(candidate)
                 elapsed_ms = (time.perf_counter_ns() - started_at) / 1_000_000
                 conflicts_after = db.conflict_log.count_conflicts()
-                can_evict = result.can_evict
+                can_evict = result.decision_type in (
+                    EvictionDecisionType.ALLOW_EVICTION,
+                    EvictionDecisionType.RELEASE_THEN_EVICT,
+                )
                 conflict_status = result.conflict_decision.status
                 logged_conflict_outcomes += conflicts_after - conflicts_before
                 decision_reason = result.eviction_decision.reason
@@ -177,7 +182,12 @@ def _run_policy(
                 ):
                     blocked_evictions += 1
 
+            unresolved_contention = can_evict and _candidate_contentions(
+                candidate, resource_manager, memory_manager
+            ) > 0
             if can_evict and memory_manager.evict_app(candidate.app_id):
+                if unresolved_contention:
+                    unresolved_contention_evictions += 1
                 db.save_app(candidate)
                 db.eviction_log.log_eviction(
                     app_id=candidate.app_id,
@@ -185,7 +195,7 @@ def _run_policy(
                     reason=decision_reason,
                     lock_checked=engine is not None,
                     safe_release=engine is not None or not candidate.held_resources,
-                    result=EvictionDecisionType.SAFE_TO_EVICT.value,
+                    result="EVICTED",
                 )
 
         orchestration_latency = (
@@ -196,6 +206,7 @@ def _run_policy(
         return PolicyMetrics(
             policy=policy,
             eviction_count=db.eviction_log.count_evictions(),
+            unresolved_contention_evictions=unresolved_contention_evictions,
             simulated_wait_freeze_proxy_count=simulated_wait_freeze_proxy_count,
             logged_conflict_outcomes=logged_conflict_outcomes,
             passive_contention_observations=passive_contention_observations,

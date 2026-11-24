@@ -82,10 +82,15 @@ component demonstration; the full Phase-II workflow runs in the dashboard.
 5. Confirm the resource holder/queue state and inspect the dashboard event log.
    Expand the SQLite **Conflict Log** and **Eviction Log** to verify recorded
    outcomes. Release any remaining resource using **Release Resource**.
-6. Run **Clock vs RAAE Evaluation** and inspect its metrics and three charts.
-   Both policies start from independent copies of the same current snapshot;
-   this is a fixed-snapshot eviction-attempt comparison, not a replay of
-   recorded operations.
+6. Run **Clock vs RAAE Evaluation** and inspect the policy metrics. Both policies
+   start from independent copies of the same current snapshot; this is a
+   fixed-snapshot eviction-attempt comparison, not a replay of recorded operations.
+   For a visible safety difference, add a priority-10 background Camera holder
+   (350 MB), a priority-1 background Maps waiter (300 MB), and a priority-2
+   background Fitness Tracker (250 MB). Have the holder request Camera, then the
+   waiter request Camera, and compare with **3 attempts**. Plain Clock should
+   record 3 evictions including 1 unresolved-contention eviction; RAAE should
+   record 1 eviction, 2 blocked attempts, and no unresolved-contention evictions.
 
 The controller currently uses SQLite `:memory:` storage for each Streamlit
 session. Database log entries are available during that session but do not
@@ -360,15 +365,21 @@ using the same eviction-attempt limit and preserving the live simulation state.
 This is a fixed-snapshot eviction-attempt comparison, not a replay of recorded
 resource requests or other workload operations. The evaluation reports
 successful evictions, Wound-Wait outcomes written to its isolated conflict log,
-and passive holder/waiter contention observations separately. The latter are
-not conflict-manager decisions. Its simulated wait/freeze proxy counts RAAE
-`WAIT` decisions; it does not establish an actual or operating-system freeze.
-Resource-blocked evictions count only non-eviction decisions in
-`WAIT`, `RESOLVE_REQUIRED`, `BLOCKED`, or `NOT_SAFE` that identify at least one
-resource. Latency is average RAAE engine orchestration time for conflict cases,
-not isolated conflict-resolver execution time; it is unavailable when no
-conflict case is measured. Plain Clock has no conflict resolver. Install the
-dashboard dependencies with `pip install -r requirements.txt`.
+unresolved-contention evictions, and passive holder/waiter contention
+observations separately. Unresolved-contention evictions are successful
+evictions where the candidate still has active holder/waiter contention; this
+is a simulated safety-risk indicator, not a real freeze. Passive contention
+observations are not conflict-manager decisions. Its simulated wait/freeze
+proxy counts RAAE `WAIT` decisions; it does not establish an actual or
+operating-system freeze. Resource-blocked evictions count only non-eviction
+decisions in `WAIT`, `RESOLVE_REQUIRED`, `BLOCKED`, or `NOT_SAFE` that identify
+at least one resource. Latency is average RAAE engine orchestration time for
+conflict cases, not isolated conflict-resolver execution time; it is unavailable
+when no conflict case is measured. If no selected candidate has active
+contention, the dashboard reports that the run is neutral and shows only the
+eviction-count chart instead of empty conflict charts. Eviction count measures
+reclamation, not safety by itself. Plain Clock has no conflict resolver. Install
+the dashboard dependencies with `pip install -r requirements.txt`.
 
 ---
 

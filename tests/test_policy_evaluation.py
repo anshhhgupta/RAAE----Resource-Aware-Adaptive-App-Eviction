@@ -70,6 +70,8 @@ class TestPolicyEvaluation(unittest.TestCase):
         self.assertEqual(comparison.raae.attempts, 1)
         self.assertEqual(comparison.plain_clock.passive_contention_observations, 1)
         self.assertEqual(comparison.raae.passive_contention_observations, 1)
+        self.assertEqual(comparison.plain_clock.unresolved_contention_evictions, 1)
+        self.assertEqual(comparison.raae.unresolved_contention_evictions, 0)
         self.assertEqual(comparison.plain_clock.logged_conflict_outcomes, 0)
         self.assertGreater(comparison.raae.logged_conflict_outcomes, 0)
         self.assertEqual(comparison.plain_clock.eviction_count, 1)
@@ -131,8 +133,51 @@ class TestPolicyEvaluation(unittest.TestCase):
         self.assertEqual(comparison.raae.logged_conflict_outcomes, 0)
         self.assertEqual(comparison.plain_clock.passive_contention_observations, 0)
         self.assertEqual(comparison.raae.passive_contention_observations, 0)
+        self.assertEqual(comparison.plain_clock.unresolved_contention_evictions, 0)
+        self.assertEqual(comparison.raae.unresolved_contention_evictions, 0)
         self.assertIsNone(comparison.plain_clock.conflict_case_orchestration_latency_ms)
         self.assertIsNone(comparison.raae.conflict_case_orchestration_latency_ms)
+
+    def test_wounded_holder_is_counted_as_evicted_after_safe_release(self):
+        holder = App(
+            app_id="holder",
+            name="Low Priority Holder",
+            priority=1,
+            state=AppState.BACKGROUND,
+            memory_footprint=300,
+            reference_bit=0,
+            last_access_time=100.0,
+            held_resources={"Camera"},
+        )
+        waiter = App(
+            app_id="waiter",
+            name="High Priority Waiter",
+            priority=10,
+            state=AppState.WAITING,
+            memory_footprint=200,
+            reference_bit=0,
+            last_access_time=200.0,
+        )
+        camera = Resource(
+            resource_id="Camera",
+            name="Camera",
+            capacity=1,
+            available_units=0,
+            holders={holder.app_id: 1},
+            waiting_queue=[waiter.app_id],
+        )
+
+        comparison = compare_eviction_policies(
+            apps=[holder, waiter],
+            resources=[camera],
+            total_memory=1024,
+            clock_hand=0,
+            max_attempts=1,
+        )
+
+        self.assertEqual(comparison.raae.eviction_count, 1)
+        self.assertEqual(comparison.raae.logged_conflict_outcomes, 1)
+        self.assertEqual(comparison.raae.unresolved_contention_evictions, 0)
 
     def test_resource_blocked_counts_require_resource_identified_blocking_status(self):
         blocking_statuses = {

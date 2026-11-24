@@ -378,6 +378,7 @@ if comparison is not None:
         {
             "Policy": metrics.policy,
             "Eviction count": metrics.eviction_count,
+            "Unresolved contention evictions": metrics.unresolved_contention_evictions,
             "Simulated wait/freeze proxy": metrics.simulated_wait_freeze_proxy_count,
             "Logged conflict outcomes": metrics.logged_conflict_outcomes,
             "Passive contention observations": metrics.passive_contention_observations,
@@ -391,6 +392,9 @@ if comparison is not None:
 
     st.caption(
         "Definitions: eviction count is successful evictions recorded in each isolated run; "
+        "unresolved contention evictions count successful evictions while the candidate still "
+        "holds or waits on a resource with active contention; this is a simulated safety-risk "
+        "indicator, not a real freeze. "
         "logged conflict outcomes count Wound-Wait outcomes written to the isolated ConflictLog; "
         "passive contention observations count selected-candidate/resource pairs with active "
         "holder/waiter contention and are not conflict-manager decisions. The simulated "
@@ -401,20 +405,50 @@ if comparison is not None:
         "no conflict case was measured. Plain Clock has no conflict resolver."
     )
 
-    chart_columns = st.columns(3)
-    chart_specs = [
-        ("Eviction count: Clock vs RAAE", "Evictions", "eviction_count"),
+    contention_observed = any(
         (
-            "Simulated wait/freeze proxy: Clock vs RAAE",
-            "Simulated wait/freeze proxy decisions",
-            "simulated_wait_freeze_proxy_count",
-        ),
-        (
-            "Logged conflict outcomes: Clock vs RAAE",
-            "Wound-Wait outcomes logged",
-            "logged_conflict_outcomes",
-        ),
-    ]
+            comparison.plain_clock.passive_contention_observations,
+            comparison.raae.passive_contention_observations,
+            comparison.raae.logged_conflict_outcomes,
+            comparison.raae.resource_blocked_evictions,
+        )
+    )
+    if contention_observed:
+        st.info(
+            f"Safety comparison: Plain Clock evicted "
+            f"{comparison.plain_clock.unresolved_contention_evictions} candidate(s) "
+            "while resource contention remained; RAAE blocked "
+            f"{comparison.raae.resource_blocked_evictions} conflicting eviction "
+            f"attempt(s) and recorded {comparison.raae.logged_conflict_outcomes} "
+            "Wound-Wait outcome(s). Eviction count measures reclamation, not safety "
+            "by itself."
+        )
+        chart_specs = [
+            ("Eviction count: Clock vs RAAE", "Evictions", "eviction_count"),
+            (
+                "Unresolved contention evictions",
+                "Potentially unsafe evictions",
+                "unresolved_contention_evictions",
+            ),
+            (
+                "Logged conflict outcomes: Clock vs RAAE",
+                "Wound-Wait outcomes logged",
+                "logged_conflict_outcomes",
+            ),
+        ]
+    else:
+        st.info(
+            "No selected candidate had an active resource conflict, so this run cannot "
+            "show RAAE's resource-safety advantage. Both policies recorded "
+            f"{comparison.plain_clock.eviction_count} Plain Clock and "
+            f"{comparison.raae.eviction_count} RAAE eviction(s). Add a resource holder "
+            "and a queued waiter, then allow enough attempts to select them."
+        )
+        chart_specs = [
+            ("Eviction count: Clock vs RAAE", "Evictions", "eviction_count"),
+        ]
+
+    chart_columns = st.columns(len(chart_specs))
     policy_results = (comparison.plain_clock, comparison.raae)
     for column, (title, y_label, attribute) in zip(chart_columns, chart_specs):
         figure, axis = plt.subplots(figsize=(4.5, 3.5))
